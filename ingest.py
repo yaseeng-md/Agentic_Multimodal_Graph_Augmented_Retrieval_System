@@ -92,28 +92,32 @@ def render_pdf_to_images(pdf_path: Path, dpi: int) -> list[Image.Image]:
     return images
 
 
-
-def document_already_ingested(client: QdrantClient, cfg: AppConfig, document_sha256: str) -> bool:
-    try:
-        result = client.scroll(
-            collection_name=cfg.collection_name,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="document_sha256",
-                        match=models.MatchValue(value=document_sha256),
-                    )
-                ]
-            ),
-            limit=1,
-            with_payload=False,
-            with_vectors=False,
-        )
-        points = result[0] if isinstance(result, tuple) else result.points
-        return len(points) > 0
-    except Exception:
-        return False
-
+def document_already_ingested(
+    client: QdrantClient,
+    cfg: AppConfig,
+    tenant_id: str,
+    document_sha256: str,
+) -> bool:
+    results = client.scroll(
+        collection_name=cfg.collection_name,
+        scroll_filter=models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="tenant_id",
+                    match=models.MatchValue(value=tenant_id),
+                ),
+                models.FieldCondition(
+                    key="document_sha256",
+                    match=models.MatchValue(value=document_sha256),
+                ),
+            ]
+        ),
+        limit=1,
+        with_payload=False,
+        with_vectors=False,
+    )
+    points, _ = results
+    return len(points) > 0
 
 
 @torch.inference_mode()
@@ -205,17 +209,31 @@ def chunked(items: Sequence, batch_size: int) -> Iterable[Sequence]:
         yield items[start : start + batch_size]
 
 
-
 def document_payload(
     pdf_path: Path,
     document_id: str,
-    entity_id: str | None,
+    tenant_id: str,
     page_index: int,
     page_count: int,
     image: Image.Image,
+    allowed_roles: Sequence[str] | None = None,
+    allowed_user_ids: Sequence[str] | None = None,
+    department: str | None = None,
+    doc_type: str | None = None,
+    sensitivity: str | None = None,
 ) -> dict:
+    """
+    Payload stored for every page-point in Qdrant.
+
+    tenant_id         -> company/workspace boundary
+    allowed_roles     -> roles that may query this document
+    allowed_user_ids  -> explicit user exceptions/allow-list
+    department        -> optional grouping, e.g. finance, engineering
+    doc_type          -> optional type, e.g. invoice, blueprint, T&C
+    sensitivity       -> optional sensitivity label
+    """
     return {
-        "entity_id": entity_id,
+        "tenant_id": tenant_id,
         "document_id": document_id,
         "document_name": pdf_path.name,
         "source_pdf": str(pdf_path),
@@ -225,9 +243,17 @@ def document_payload(
         "page_count": page_count,
         "page_sha256": image_sha256(image),
         "uploaded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "allowed_roles": list(allowed_roles or []),
+        "allowed_user_ids": list(allowed_user_ids or []),
+        "department": department,
+        "doc_type": doc_type,
+        "sensitivity": sensitivity,
     }
 
 
+# ----------------------------
+# Ingestion
+# ----------------------------
 
 def ingest_documents(
     client: QdrantClient,
@@ -235,10 +261,16 @@ def ingest_documents(
     model: ColPali,
     processor: ColPaliProcessor,
     pdf_paths: Sequence[Path],
-    entity_id: str | None = None,
+    tenant_id: str,
+    allowed_roles: Sequence[str],
+    allowed_user_ids: Sequence[str] | None = None,
+    department: str | None = None,
+    doc_type: str | None = None,
+    sensitivity: str | None = None,
 ) -> list[PageArtifacts]:
     if len(pdf_paths) == 0:
         return []
+
     if len(pdf_paths) > cfg.max_upload_docs:
         raise ValueError(f"At most {cfg.max_upload_docs} documents can be uploaded per batch")
 
@@ -254,8 +286,12 @@ def ingest_documents(
             raise RuntimeError(f"No pages rendered from {pdf_path}")
 
         doc_sha256 = file_sha256(pdf_path)
-        if document_already_ingested(client, cfg, doc_sha256):
-            LOGGER.info("Skipping already ingested document: %s", pdf_path.name)
+
+        # IMPORTANT:
+        # Duplicate detection must be tenant-scoped, not global.
+        # Same PDF uploaded by a different company should still be allowed.
+        if document_already_ingested(client, cfg, tenant_id, doc_sha256):
+            LOGGER.info("Skipping already ingested document for tenant %s: %s", tenant_id, pdf_path.name)
             continue
 
         if not collection_initialized:
@@ -269,17 +305,27 @@ def ingest_documents(
         artifacts: list[PageArtifacts] = []
 
         for batch_index, image_batch in enumerate(chunked(images, cfg.batch_size), start=1):
-            LOGGER.info("Embedding batch %d (%d pages) for %s", batch_index, len(image_batch), pdf_path.name)
+            LOGGER.info(
+                "Embedding batch %d (%d pages) for %s",
+                batch_index,
+                len(image_batch),
+                pdf_path.name,
+            )
             vectors = embed_page_batch(model, processor, image_batch)
 
             for page_offset, (image, vecs) in enumerate(zip(image_batch, vectors), start=len(artifacts)):
                 payload = document_payload(
                     pdf_path=pdf_path,
                     document_id=document_id,
-                    entity_id=entity_id,
+                    tenant_id=tenant_id,
                     page_index=page_offset,
                     page_count=len(images),
                     image=image,
+                    allowed_roles=allowed_roles,
+                    allowed_user_ids=allowed_user_ids,
+                    department=department,
+                    doc_type=doc_type,
+                    sensitivity=sensitivity,
                 )
 
                 point_id = f"{document_id}:{page_offset}"
@@ -313,8 +359,6 @@ def ingest_documents(
         all_artifacts.extend(artifacts)
 
     return all_artifacts
-
-
 
 
 @dataclass
