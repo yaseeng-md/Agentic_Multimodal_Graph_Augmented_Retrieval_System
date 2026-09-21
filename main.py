@@ -4,15 +4,15 @@ import asyncio
 import shutil
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
+import uvicorn
 from uuid import uuid4
-
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from qdrant_client import QdrantClient
 from config import AppConfig, override_config
 from ingest import ingest_documents, IngestManager, save_upload_sync, IngestJob
-from utils import (
+from data import UserContext
+from helpers import (
     load_model_and_processor,
     select_device,
     load_visual_config,
@@ -21,6 +21,7 @@ from utils import (
 LOGGER = logging.getLogger("ingest_api")
 UPLOAD_DIR = Path("./uploaded_pdfs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_MODEL_DIR = Path("./models/colpali-v1.3")
 
 
 @asynccontextmanager
@@ -35,9 +36,10 @@ async def lifespan(app: FastAPI):
         cfg.ingest_queue_size = 100
 
     device, dtype = select_device()
-    model, processor = load_model_and_processor(device, dtype)
 
-    client = QdrantClient(url=cfg.qdrant_url, api_key=cfg.qdrant_api_key)
+    model, processor = load_model_and_processor()
+
+    client = QdrantClient(url=cfg.qdrant_url, api_key=cfg.qdrant_api_key, timeout=300)
 
     manager = IngestManager(cfg, client, model, processor)
 
@@ -54,11 +56,15 @@ async def lifespan(app: FastAPI):
 # Load FastAPI App
 app = FastAPI(lifespan=lifespan)
 
-
 @app.post("/ingest")
 async def ingest(
     files: list[UploadFile] = File(...),
-    entity_id: str | None = Form(None),
+    tenant_id: str = Form(...),
+    department: str = Form(...),
+    doc_type: str = Form(...),
+    sensitivity: str = Form(...),
+    allowed_roles: list[str] = Form(...),
+    allowed_user_ids: list[str] = Form(default=[]),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="No PDF files uploaded")
@@ -68,17 +74,26 @@ async def ingest(
 
     for upload in files:
         if not (upload.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"{upload.filename} is not a PDF")
+            raise HTTPException(
+                status_code=400,
+                detail=f"{upload.filename} is not a PDF",
+            )
 
         saved_path = await asyncio.to_thread(save_upload_sync, upload)
         await upload.close()
 
         job_id = uuid4().hex
+
         await manager.enqueue(
             IngestJob(
                 job_id=job_id,
-                pdf_paths=[saved_path],   # one PDF = one job
-                entity_id=entity_id,
+                pdf_paths=[saved_path],
+                tenant_id=tenant_id,
+                allowed_roles=allowed_roles,
+                allowed_user_ids=allowed_user_ids,
+                department=department,
+                doc_type=doc_type,
+                sensitivity=sensitivity,
             )
         )
 
@@ -95,3 +110,13 @@ async def ingest(
         "worker_count": manager.worker_count,
         "queued_jobs": jobs,
     }
+
+
+if __name__ == "__main__":
+
+    uvicorn.run(
+        "main:app",      # Replace 'main' with your Python filename (without .py)
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+    )

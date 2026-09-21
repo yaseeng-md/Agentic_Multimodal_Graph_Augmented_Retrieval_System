@@ -4,15 +4,10 @@ from PIL import Image, ImageDraw
 from colpali_engine.models import ColPali, ColPaliProcessor
 from qdrant_client import QdrantClient, models
 from config import AppConfig
-from dataclasses import dataclass
 from typing import Sequence
+from data import UserContext
 
-@dataclass(slots=True)
-class UserContext:
-    tenant_id: str
-    user_id: str
-    roles: Sequence[str]
-    
+
 @torch.inference_mode()
 def embed_query(
     model: ColPali,

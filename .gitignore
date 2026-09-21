@@ -4,6 +4,8 @@
 /explainability_output
 /models
 /qdrant_storage
+/uploaded_pdfs
+/notebooks
 pipeline_logs.md
 dummy.py
 

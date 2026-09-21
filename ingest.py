@@ -7,7 +7,6 @@ import math
 import os
 import time
 import shutil
-from dataclasses import dataclass
 from uuid import uuid4
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +23,7 @@ from uuid import uuid4
 import asyncio
 from fastapi import UploadFile
 from config import AppConfig, override_config
-
+from data import PageArtifacts, IngestJob
 
 LOGGER = logging.getLogger("colpali_qdrant")
 
@@ -36,17 +35,6 @@ UPLOAD_DIR = Path("./uploaded_pdfs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-
-@dataclass
-class PageArtifacts:
-    page_index: int
-    page_number: int
-    image: Image.Image
-    original: torch.Tensor
-    image_patch_embeddings: torch.Tensor
-    x_patches: int
-    y_patches: int
-    payload: dict
 
 def dir_size_bytes(path: Path) -> int:
     if not path.exists():
@@ -177,30 +165,10 @@ def ensure_collection(client: QdrantClient, cfg: AppConfig, vector_size: int, re
     LOGGER.info("Creating collection %s", cfg.collection_name)
     client.create_collection(
         collection_name=cfg.collection_name,
-        vectors_config={
-            "original": models.VectorParams(
-                size=vector_size,
-                distance=models.Distance.COSINE,
-                multivector_config=models.MultiVectorConfig(
-                    comparator=models.MultiVectorComparator.MAX_SIM
-                ),
-                hnsw_config=models.HnswConfigDiff(m=0),
-            ),
-            "mean_pooling_rows": models.VectorParams(
-                size=vector_size,
-                distance=models.Distance.COSINE,
-                multivector_config=models.MultiVectorConfig(
-                    comparator=models.MultiVectorComparator.MAX_SIM
-                ),
-            ),
-            "mean_pooling_columns": models.VectorParams(
-                size=vector_size,
-                distance=models.Distance.COSINE,
-                multivector_config=models.MultiVectorConfig(
-                    comparator=models.MultiVectorComparator.MAX_SIM
-                ),
-            ),
-        },
+        vectors_config=models.VectorParams(
+            size=vector_size,
+            distance=models.Distance.COSINE,
+        ),
     )
 
 
@@ -327,8 +295,7 @@ def ingest_documents(
                     doc_type=doc_type,
                     sensitivity=sensitivity,
                 )
-
-                point_id = f"{document_id}:{page_offset}"
+                point_id = str(uuid4())
                 points.append(
                     models.PointStruct(
                         id=point_id,
@@ -361,11 +328,7 @@ def ingest_documents(
     return all_artifacts
 
 
-@dataclass
-class IngestJob:
-    job_id: str
-    pdf_paths: list[Path]
-    entity_id: str | None = None
+
 
 def save_upload_sync(upload: UploadFile) -> Path:
     suffix = Path(upload.filename or "document.pdf").suffix or ".pdf"
@@ -424,12 +387,13 @@ class IngestManager:
                 # ingest_documents is blocking, so run it off the event loop
                 await asyncio.to_thread(
                     ingest_documents,
-                    self.client,
-                    self.cfg,
-                    self.model,
-                    self.processor,
-                    job.pdf_paths,
-                    job.entity_id,
+                    client=self.client,
+                    cfg = self.cfg,
+                    model = self.model,
+                    processor = self.processor,
+                    pdf_paths = job.pdf_paths,
+                    tenant_id = job.tenant_id,
+                    allowed_roles = job.allowed_roles 
                 )
 
                 LOGGER.info("Job %s completed", job.job_id)
