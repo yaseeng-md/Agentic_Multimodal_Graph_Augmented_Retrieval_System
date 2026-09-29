@@ -658,9 +658,14 @@ def ingest_files(jobs: list[IngestJob]) -> list[dict]:
         results: list[dict] = []
 
         for job in jobs:
-            # Exact duplicate check happens before model initialization for
-            # duplicate-only batches. This avoids loading GPU weights needlessly.
-            if job.pdf_path.exists():
+            try:
+                # Exact duplicate check happens before model initialization for
+                # duplicate-only batches. This avoids loading GPU weights needlessly.
+                if not job.pdf_path.exists():
+                    raise FileNotFoundError(f"PDF does not exist: {job.pdf_path}")
+                if job.pdf_path.suffix.lower() != ".pdf":
+                    raise ValueError(f"Expected a PDF file: {job.pdf_path}")
+
                 file_hash = sha256_file(job.pdf_path)
                 existing = registry.get_by_file_hash(file_hash)
                 if existing is not None:
@@ -679,20 +684,32 @@ def ingest_files(jobs: list[IngestJob]) -> list[dict]:
                         job.pdf_path,
                     )
                     continue
-            else:
-                raise FileNotFoundError(f"PDF does not exist: {job.pdf_path}")
 
-            if embedder is None:
-                embedder = ColPaliEmbedder(MODEL_ID, device)
+                if embedder is None:
+                    embedder = ColPaliEmbedder(MODEL_ID, device)
 
-            result = ingest_one_document(
-                job=job,
-                registry=registry,
-                embedder=embedder,
-                qdrant=qdrant,
-                signature=signature,
-            )
-            results.append(result)
+                result = ingest_one_document(
+                    job=job,
+                    registry=registry,
+                    embedder=embedder,
+                    qdrant=qdrant,
+                    signature=signature,
+                )
+                results.append(result)
+
+            except Exception as exc:
+                # V1 API contract: one bad file must not abort the remaining
+                # files in the same ingestion job. The shared ColPali model
+                # remains alive for subsequent files.
+                logger.exception("Ingestion failed for %s", job.pdf_path)
+                results.append(
+                    {
+                        "status": "failed",
+                        "filename": job.pdf_path.name,
+                        "source_path": str(job.pdf_path),
+                        "error": str(exc),
+                    }
+                )
 
         return results
     finally:
