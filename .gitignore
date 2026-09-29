@@ -9,3 +9,6 @@
 pipeline_logs.md
 dummy.py
 .env
+/__pycache__
+/.vscode
+debuggers.py
