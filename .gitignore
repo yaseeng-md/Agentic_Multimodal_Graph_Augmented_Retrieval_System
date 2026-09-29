@@ -8,4 +8,4 @@
 /notebooks
 pipeline_logs.md
 dummy.py
-
+.env
