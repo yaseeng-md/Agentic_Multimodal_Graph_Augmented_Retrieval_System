@@ -39,6 +39,8 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingest import DATA_DIR, IngestJob, ingest_files
+from docker_manager import start_qdrant, stop_qdrant
+from ingest import DATA_DIR, IngestJob, ingest_files
 
 logger = logging.getLogger("multimodal-rag-api")
 
@@ -687,22 +689,34 @@ def _run_job(job_id: str, request: IngestRequest) -> None:
 # FastAPI lifecycle
 # ---------------------------------------------------------------------------
 
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _executor
+
+    # Make sure Docker + Qdrant are available before accepting ingestion work.
+    start_qdrant()
+
     job_store.recover_running_jobs()
+
     _executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="ingestion",
     )
-    logger.info("AMG ingestion API started")
-    yield
-    if _executor is not None:
-        _executor.shutdown(wait=False, cancel_futures=False)
-    _executor = None
-    logger.info("AMG ingestion API stopped")
 
+    logger.info("AMG ingestion API started")
+
+    try:
+        yield
+    finally:
+        if _executor is not None:
+            _executor.shutdown(wait=False, cancel_futures=False)
+
+        _executor = None
+
+        # Only stops Qdrant if this API process started it.
+        stop_qdrant()
+
+        logger.info("AMG ingestion API stopped")
 
 app = FastAPI(
     title="AMG Multimodal RAG Ingestion API",
