@@ -203,4 +203,27 @@ class Registry:
         self.conn.commit()
         self._create_tables()
 
+    def list_document_versions(self) -> list[sqlite3.Row]:
+        """Return one row for every document/version pair."""
+        return list(
+            self.conn.execute(
+                """
+                SELECT
+                    v.original_filename AS filename,
+                    v.document_id AS document_id,
+                    v.version_id AS version_id,
+                    v.version_number AS version_number,
+                    CASE
+                        WHEN d.current_version_id = v.version_id
+                        THEN 1
+                        ELSE 0
+                    END AS is_current
+                FROM versions v
+                JOIN documents d
+                    ON d.document_id = v.document_id
+                ORDER BY v.document_id, v.version_number
+                """
+            ).fetchall()
+        )
+
 

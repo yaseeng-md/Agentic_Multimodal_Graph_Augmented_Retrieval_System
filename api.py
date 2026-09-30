@@ -38,9 +38,9 @@ from urllib.request import Request, urlopen
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ingest import DATA_DIR, IngestJob, ingest_files
+from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
+from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
-from ingest import DATA_DIR, IngestJob, ingest_files
 
 logger = logging.getLogger("multimodal-rag-api")
 
@@ -734,6 +734,31 @@ app = FastAPI(
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
+
+@app.get("/list_documents")
+def list_documents() -> dict[str, list[dict[str, Any]]]:
+    registry = Registry(REGISTRY_DB_PATH)
+
+    try:
+        rows = registry.list_document_versions()
+
+        documents = [
+            {
+                "filename": row["filename"],
+                "document_id": row["document_id"],
+                "version_id": row["version_id"],
+                "version_number": row["version_number"],
+                "is_current": bool(row["is_current"]),
+            }
+            for row in rows
+        ]
+
+        return {
+            "documents": documents
+        }
+
+    finally:
+        registry.close()
 
 @app.post(
     "/ingest_document",
