@@ -257,6 +257,51 @@ def get_query_encoder() -> QueryEncoder:
 
 
 # ---------------------------------------------------------------------------
+# GPU memory lifecycle
+# ---------------------------------------------------------------------------
+def release_query_encoder() -> None:
+    """
+    Release the process-local ColPali model and its processor.
+
+    This is useful on low-VRAM systems where a second GPU model (for example,
+    a generation VLM) must run after retrieval.
+
+    Behavior is controlled by the caller; this function only performs the
+    release when explicitly called.
+    """
+    global _QUERY_ENCODER
+
+    if _QUERY_ENCODER is None:
+        return
+
+    encoder = _QUERY_ENCODER
+    _QUERY_ENCODER = None
+
+    # Drop model/processor references first.
+    try:
+        del encoder.model
+    except AttributeError:
+        pass
+
+    try:
+        del encoder.processor
+    except AttributeError:
+        pass
+
+    del encoder
+
+    import gc
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    print("[QueryEncoder] Released ColPali resources.")
+
+
+# ---------------------------------------------------------------------------
 # Retrieval policy
 # ---------------------------------------------------------------------------
 def _normalise_ids(values: Optional[Iterable[str]]) -> list[str]:
