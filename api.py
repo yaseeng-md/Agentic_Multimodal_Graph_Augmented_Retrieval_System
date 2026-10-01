@@ -29,6 +29,7 @@ from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
 from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
 from query import retrieve
+from generate import generate_answer
 
 logger = logging.getLogger("multimodal-rag-api")
 
@@ -63,8 +64,24 @@ QUERY_LOG_DIR = Path(
 )
 QUERY_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+GENERATE_JOB_DB_PATH = Path(
+    os.getenv(
+        "GENERATE_JOB_DB_PATH",
+        str(DATA_DIR / "generate_jobs.db"),
+    )
+)
+
+GENERATE_LOG_DIR = Path(
+    os.getenv(
+        "GENERATE_LOG_DIR",
+        str(DATA_DIR / "generate"),
+    )
+)
+GENERATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 JOB_ID_RE = re.compile(r"^ingest_[a-zA-Z0-9_-]+$")
 QUERY_JOB_ID_RE = re.compile(r"^query_[a-zA-Z0-9_-]+$")
+GENERATE_JOB_ID_RE = re.compile(r"^generate_[a-zA-Z0-9_-]+$")
 
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
@@ -106,6 +123,14 @@ def get_executor() -> ThreadPoolExecutor:
 def new_query_job_id() -> str:
     return (
         f"query_"
+        f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def new_generate_job_id() -> str:
+    return (
+        f"generate_"
         f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}_"
         f"{uuid.uuid4().hex[:8]}"
     )
@@ -385,6 +410,198 @@ class QueryJobStore:
             "result": result,
             "error": row["error"],
         }
+
+
+class GenerateJobStore:
+    """SQLite-backed status/result store for answer-generation jobs."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS generate_jobs (
+                    generate_job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    organization TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    document_ids TEXT NOT NULL,
+                    version_ids TEXT NOT NULL,
+                    recursive_search INTEGER NOT NULL,
+                    top_k INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result TEXT,
+                    error TEXT
+                )
+                """
+            )
+
+    def create_job(
+        self,
+        *,
+        generate_job_id: str,
+        request: QueryRequest,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO generate_jobs (
+                    generate_job_id,
+                    user_id,
+                    organization,
+                    role,
+                    query,
+                    document_ids,
+                    version_ids,
+                    recursive_search,
+                    top_k,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                (
+                    generate_job_id,
+                    request.user_id,
+                    request.organization,
+                    request.role,
+                    request.query,
+                    json.dumps(request.document_ids),
+                    json.dumps(request.version_ids),
+                    int(request.recursive_search),
+                    request.top_k,
+                    utc_now(),
+                ),
+            )
+
+    def mark_running(self, generate_job_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE generate_jobs
+                SET status='running',
+                    started_at=?
+                WHERE generate_job_id=?
+                """,
+                (utc_now(), generate_job_id),
+            )
+
+    def mark_completed(
+        self,
+        generate_job_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE generate_jobs
+                SET status='completed',
+                    finished_at=?,
+                    result=?,
+                    error=NULL
+                WHERE generate_job_id=?
+                """,
+                (
+                    utc_now(),
+                    json.dumps(result, ensure_ascii=False),
+                    generate_job_id,
+                ),
+            )
+
+    def mark_failed(
+        self,
+        generate_job_id: str,
+        error: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE generate_jobs
+                SET status='failed',
+                    finished_at=?,
+                    error=?
+                WHERE generate_job_id=?
+                """,
+                (
+                    utc_now(),
+                    error,
+                    generate_job_id,
+                ),
+            )
+
+    def get_job(
+        self,
+        generate_job_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM generate_jobs
+                WHERE generate_job_id=?
+                """,
+                (generate_job_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "generate_job_id": row["generate_job_id"],
+            "user_id": row["user_id"],
+            "organization": row["organization"],
+            "role": row["role"],
+            "query": row["query"],
+            "document_ids": json.loads(row["document_ids"]),
+            "version_ids": json.loads(row["version_ids"]),
+            "recursive_search": bool(row["recursive_search"]),
+            "top_k": row["top_k"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "result": (
+                json.loads(row["result"])
+                if row["result"]
+                else None
+            ),
+            "error": row["error"],
+        }
+
+    def recover_running_jobs(self) -> None:
+        """
+        Mark queued/running generation jobs as failed after API restart.
+
+        V1 uses an in-process executor, so these jobs are not automatically
+        resumed.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE generate_jobs
+                SET status='failed',
+                    finished_at=?,
+                    error=?
+                WHERE status IN ('queued', 'running')
+                """,
+                (
+                    utc_now(),
+                    "API process restarted while generation job was running.",
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +903,7 @@ class JobStore:
 
 job_store = JobStore(API_JOB_DB_PATH)
 query_job_store = QueryJobStore(QUERY_JOB_DB_PATH)
+generate_job_store = GenerateJobStore(GENERATE_JOB_DB_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1216,234 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
         )
 
 
+
+
+def save_generate_log(
+    generate_job_id: str,
+    request: QueryRequest,
+    *,
+    status_value: str,
+    created_at: str,
+    started_at: str | None,
+    finished_at: str | None,
+    retrieval: dict[str, Any] | None,
+    response: dict[str, Any] | None,
+    error: str | None,
+) -> None:
+    """
+    Persist the complete generation execution record.
+
+    File:
+        data/generate/<generate_job_id>.json
+
+    Includes:
+        - exact request input
+        - retrieval configuration and ranked pages
+        - generation metadata
+        - final response
+        - timing
+        - error information
+    """
+    duration_ms = None
+
+    if started_at and finished_at:
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            finished_dt = datetime.fromisoformat(finished_at)
+            duration_ms = round(
+                (finished_dt - started_dt).total_seconds() * 1000,
+                3,
+            )
+        except Exception:
+            duration_ms = None
+
+    generation_metadata = None
+
+    if isinstance(response, dict):
+        generation_metadata = response.get("generation")
+
+    log_data = {
+        "job": {
+            "generate_job_id": generate_job_id,
+            "status": status_value,
+            "created_at": created_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms,
+        },
+        "request": {
+            "user_id": request.user_id,
+            "organization": request.organization,
+            "role": request.role,
+            "query": request.query,
+            "document_ids": request.document_ids,
+            "version_ids": request.version_ids,
+            "recursive_search": request.recursive_search,
+            "top_k": request.top_k,
+        },
+        "retrieval": retrieval,
+        "execution": generation_metadata,
+        "response": {
+            "status": (
+                "success"
+                if status_value == "completed"
+                else "failed"
+            ),
+            "result": response,
+        },
+        "error": error,
+    }
+
+    log_path = GENERATE_LOG_DIR / f"{generate_job_id}.json"
+    temp_path = GENERATE_LOG_DIR / f".{generate_job_id}.tmp"
+
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            log_data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    # Atomic replacement just like the existing query logging approach.
+    temp_path.replace(log_path)
+
+    logger.info(
+        "Saved generation log: %s",
+        log_path,
+    )
+
+
+def _run_generate_job(
+    generate_job_id: str,
+    request: QueryRequest,
+) -> None:
+    """
+    Execute:
+        retrieve() -> generate_answer()
+
+    Retrieval is kept as a separate local stage so that, if generation fails,
+    the retrieved evidence can still be written to the audit JSON.
+    """
+    logger.info(
+        "Starting generation job %s",
+        generate_job_id,
+    )
+
+    generate_job_store.mark_running(generate_job_id)
+
+    job = generate_job_store.get_job(generate_job_id)
+
+    created_at = (
+        job["created_at"]
+        if job
+        else utc_now()
+    )
+
+    started_at = (
+        job["started_at"]
+        if job
+        else utc_now()
+    )
+
+    retrieval_result: dict[str, Any] | None = None
+    response: dict[str, Any] | None = None
+
+    try:
+        # ---------------------------------------------------------------
+        # Stage 1: existing retrieval
+        # ---------------------------------------------------------------
+        retrieval_result = retrieve(
+            query=request.query,
+            document_ids=request.document_ids,
+            version_ids=request.version_ids,
+            recursive_search=request.recursive_search,
+            top_k=request.top_k,
+        )
+
+        # ---------------------------------------------------------------
+        # Stage 2: existing generation layer
+        #
+        # generate_answer() is responsible for the configured GPU lifecycle
+        # including releasing ColPali before Qwen when enabled.
+        # ---------------------------------------------------------------
+        response = generate_answer(
+            query=request.query,
+            retrieval_result=retrieval_result,
+        )
+
+        if not isinstance(response, dict):
+            raise RuntimeError(
+                "generate_answer() returned an invalid result."
+            )
+
+        generate_job_store.mark_completed(
+            generate_job_id,
+            response,
+        )
+
+        completed_job = generate_job_store.get_job(
+            generate_job_id,
+        )
+
+        finished_at = (
+            completed_job["finished_at"]
+            if completed_job
+            else utc_now()
+        )
+
+        save_generate_log(
+            generate_job_id=generate_job_id,
+            request=request,
+            status_value="completed",
+            created_at=created_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            retrieval=retrieval_result,
+            response=response,
+            error=None,
+        )
+
+        logger.info(
+            "Finished generation job %s",
+            generate_job_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Generation job failed: %s",
+            generate_job_id,
+        )
+
+        generate_job_store.mark_failed(
+            generate_job_id,
+            str(exc),
+        )
+
+        failed_job = generate_job_store.get_job(
+            generate_job_id,
+        )
+
+        finished_at = (
+            failed_job["finished_at"]
+            if failed_job
+            else utc_now()
+        )
+
+        save_generate_log(
+            generate_job_id=generate_job_id,
+            request=request,
+            status_value="failed",
+            created_at=created_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            retrieval=retrieval_result,
+            response=response,
+            error=str(exc),
+        )
+
+
 def save_query_log(
     query_job_id: str,
     request: QueryRequest,
@@ -1121,6 +1567,7 @@ async def lifespan(_: FastAPI):
     start_qdrant()
 
     job_store.recover_running_jobs()
+    generate_job_store.recover_running_jobs()
 
     _executor = ThreadPoolExecutor(
         max_workers=1,
@@ -1314,6 +1761,109 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
         )
 
     return job
+
+
+@app.post(
+    "/generate",
+    response_model=AcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_generate_job(
+    request: QueryRequest,
+) -> AcceptedResponse:
+    """
+    Submit an asynchronous retrieval + answer-generation job.
+
+    The request contract intentionally matches POST /query.
+    """
+    generate_job_id = new_generate_job_id()
+
+    try:
+        generate_job_store.create_job(
+            generate_job_id=generate_job_id,
+            request=request,
+        )
+
+        executor = get_executor()
+
+        # V1 uses the existing single worker. On the 6 GB GPU this means
+        # generation jobs are queued rather than competing for VRAM.
+        executor.submit(
+            _run_generate_job,
+            generate_job_id,
+            request,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Could not create generation job"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Could not create generation job: {exc}"
+            ),
+        ) from exc
+
+    return AcceptedResponse(
+        job_id=generate_job_id,
+        status="accepted",
+        message="Generation job accepted.",
+    )
+
+
+@app.get("/generate/{generate_job_id}")
+def get_generate_job(
+    generate_job_id: str,
+) -> dict[str, Any]:
+    """
+    Poll a generation job.
+
+    While running:
+        returns only status/job_id.
+
+    When completed:
+        returns ONLY the generated result.
+
+    Complete request/retrieval/generation audit data is stored in:
+        data/generate/<generate_job_id>.json
+    """
+    if not GENERATE_JOB_ID_RE.fullmatch(
+        generate_job_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid generate_job_id format",
+        )
+
+    job = generate_job_store.get_job(
+        generate_job_id,
+    )
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Generation job not found: "
+                f"{generate_job_id}"
+            ),
+        )
+
+    if job["status"] in {"queued", "running"}:
+        return {
+            "job_id": generate_job_id,
+            "status": job["status"],
+        }
+
+    if job["status"] == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=job["error"] or "Generation job failed.",
+        )
+
+    # Completed: ONLY return the actual generated result.
+    return job["result"]
 
 
 if __name__ == "__main__":
