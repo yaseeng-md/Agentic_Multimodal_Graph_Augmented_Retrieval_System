@@ -178,4 +178,5 @@ def stop_qdrant():
 
 
 if __name__ == "__main__":
-    start_qdrant()
+    # start_qdrant()
+    stop_qdrant()

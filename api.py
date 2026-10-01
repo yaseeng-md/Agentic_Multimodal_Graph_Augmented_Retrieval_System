@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
 from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
+from query import retrieve
 
 logger = logging.getLogger("multimodal-rag-api")
 
@@ -66,7 +67,17 @@ S3_ALLOWED_HOSTS = {
     if host.strip()
 }
 
+QUERY_JOB_DB_PATH = Path(
+    os.getenv("QUERY_JOB_DB_PATH", str(DATA_DIR / "query_jobs.db"))
+)
+
+QUERY_LOG_DIR = Path(
+    os.getenv("QUERY_LOG_DIR", str(DATA_DIR / "query"))
+)
+QUERY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 JOB_ID_RE = re.compile(r"^ingest_[a-zA-Z0-9_-]+$")
+QUERY_JOB_ID_RE = re.compile(r"^query_[a-zA-Z0-9_-]+$")
 
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
@@ -102,6 +113,16 @@ def get_executor() -> ThreadPoolExecutor:
                 thread_name_prefix="ingestion",
             )
         return _executor
+
+
+
+def new_query_job_id() -> str:
+    return (
+        f"query_"
+        f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +191,213 @@ class AcceptedResponse(BaseModel):
     job_id: str
     status: str
     message: str
+
+
+class QueryRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+    organization: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+
+    query: str = Field(min_length=1)
+
+    document_ids: list[str] = Field(default_factory=list)
+    version_ids: list[str] = Field(default_factory=list)
+
+    recursive_search: bool = False
+
+    top_k: int = Field(default=5, ge=1)
+
+    @field_validator("user_id", "organization", "role", "query")
+    @classmethod
+    def strip_required_strings(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("must not be empty")
+
+        return value
+
+    @field_validator("document_ids", "version_ids")
+    @classmethod
+    def clean_ids(cls, values: list[str]) -> list[str]:
+        cleaned = []
+
+        for value in values:
+            value = value.strip()
+
+            if not value:
+                raise ValueError("IDs cannot contain empty strings")
+
+            cleaned.append(value)
+
+        # Remove duplicates while preserving order.
+        return list(dict.fromkeys(cleaned))
+
+
+class QueryJobStore:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_jobs (
+                    query_job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    organization TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    document_ids TEXT NOT NULL,
+                    version_ids TEXT NOT NULL,
+                    recursive_search INTEGER NOT NULL,
+                    top_k INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result TEXT,
+                    error TEXT
+                )
+                """
+            )
+
+    def create_job(
+        self,
+        *,
+        query_job_id: str,
+        request: QueryRequest,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO query_jobs (
+                    query_job_id,
+                    user_id,
+                    organization,
+                    role,
+                    query,
+                    document_ids,
+                    version_ids,
+                    recursive_search,
+                    top_k,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                (
+                    query_job_id,
+                    request.user_id,
+                    request.organization,
+                    request.role,
+                    request.query,
+                    json.dumps(request.document_ids),
+                    json.dumps(request.version_ids),
+                    int(request.recursive_search),
+                    request.top_k,
+                    utc_now(),
+                ),
+            )
+
+    def mark_running(self, query_job_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE query_jobs
+                SET status='running',
+                    started_at=?
+                WHERE query_job_id=?
+                """,
+                (utc_now(), query_job_id),
+            )
+
+    def mark_completed(
+        self,
+        query_job_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE query_jobs
+                SET status='completed',
+                    finished_at=?,
+                    result=?,
+                    error=NULL
+                WHERE query_job_id=?
+                """,
+                (
+                    utc_now(),
+                    json.dumps(result),
+                    query_job_id,
+                ),
+            )
+
+    def mark_failed(
+        self,
+        query_job_id: str,
+        error: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE query_jobs
+                SET status='failed',
+                    finished_at=?,
+                    error=?
+                WHERE query_job_id=?
+                """,
+                (
+                    utc_now(),
+                    error,
+                    query_job_id,
+                ),
+            )
+
+    def get_job(self, query_job_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM query_jobs
+                WHERE query_job_id=?
+                """,
+                (query_job_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        result = None
+
+        if row["result"]:
+            result = json.loads(row["result"])
+
+        return {
+            "query_job_id": row["query_job_id"],
+            "user_id": row["user_id"],
+            "organization": row["organization"],
+            "role": row["role"],
+            "query": row["query"],
+            "document_ids": json.loads(row["document_ids"]),
+            "version_ids": json.loads(row["version_ids"]),
+            "recursive_search": bool(row["recursive_search"]),
+            "top_k": row["top_k"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "result": result,
+            "error": row["error"],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +698,7 @@ class JobStore:
 
 
 job_store = JobStore(API_JOB_DB_PATH)
+query_job_store = QueryJobStore(QUERY_JOB_DB_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +914,214 @@ def _run_job(job_id: str, request: IngestRequest) -> None:
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
+def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
+
+    logger.info(
+        "Starting query job %s",
+        query_job_id,
+    )
+
+    query_job_store.mark_running(query_job_id)
+
+    # Get the persisted job so the log uses the same timestamps
+    job = query_job_store.get_job(query_job_id)
+
+    created_at = job["created_at"] if job else datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    started_at = job["started_at"] if job else datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    try:
+
+        result = retrieve(
+            query=request.query,
+            document_ids=request.document_ids,
+            version_ids=request.version_ids,
+            recursive_search=request.recursive_search,
+            top_k=request.top_k,
+        )
+
+        # Persist result in SQLite
+        query_job_store.mark_completed(
+            query_job_id,
+            result,
+        )
+
+        # Get final timestamp from DB
+        job = query_job_store.get_job(query_job_id)
+
+        finished_at = (
+            job["finished_at"]
+            if job
+            else datetime.now(timezone.utc).isoformat()
+        )
+
+        # Save complete JSON audit/debug record
+        save_query_log(
+            query_job_id=query_job_id,
+            request=request,
+            status="completed",
+            created_at=created_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            result=result,
+            error=None,
+        )
+
+        logger.info(
+            "Finished query job %s",
+            query_job_id,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Query job failed: %s",
+            query_job_id,
+        )
+
+        # Persist error in SQLite
+        query_job_store.mark_failed(
+            query_job_id,
+            str(exc),
+        )
+
+        # Get final timestamp
+        job = query_job_store.get_job(query_job_id)
+
+        finished_at = (
+            job["finished_at"]
+            if job
+            else datetime.now(timezone.utc).isoformat()
+        )
+
+        # Save failed query too
+        save_query_log(
+            query_job_id=query_job_id,
+            request=request,
+            status="failed",
+            created_at=created_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            result=None,
+            error=str(exc),
+        )
+
+
+def save_query_log(
+    query_job_id: str,
+    request: QueryRequest,
+    *,
+    status: str,
+    created_at: str,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    result: Any = None,
+    error: str | None = None,
+) -> None:
+    """
+    Save a complete query execution record for debugging,
+    auditing and fault-tolerance.
+    """
+
+    duration_ms = None
+
+    if started_at and finished_at:
+        try:
+            start_dt = datetime.fromisoformat(started_at)
+            finish_dt = datetime.fromisoformat(finished_at)
+            duration_ms = round(
+                (finish_dt - start_dt).total_seconds() * 1000,
+                3,
+            )
+        except Exception:
+            duration_ms = None
+
+    # Determine retrieval scope
+    if request.document_ids:
+        scope = "specified_documents"
+    elif request.version_ids:
+        scope = "specified_versions"
+    elif request.recursive_search:
+        scope = "all_documents_all_versions"
+    else:
+        scope = "latest_versions"
+
+    result_count = None
+
+    if isinstance(result, dict):
+        # Support common result formats.
+        if "result_count" in result:
+            result_count = result["result_count"]
+        elif isinstance(result.get("results"), list):
+            result_count = len(result["results"])
+
+    log_data = {
+        "job": {
+            "query_job_id": query_job_id,
+            "status": status,
+            "created_at": created_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms,
+        },
+
+        "request": {
+            "user_id": request.user_id,
+            "organization": request.organization,
+            "role": request.role,
+            "query": request.query,
+            "document_ids": request.document_ids,
+            "version_ids": request.version_ids,
+            "recursive_search": request.recursive_search,
+            "top_k": request.top_k,
+        },
+
+        "retrieval": {
+            "scope": scope,
+            "result_count": result_count,
+        },
+
+        "execution": {
+            "model_id": "vidore/colpali-v1.3-merged",
+            "quantization": "bitsandbytes_4bit_nf4",
+            "embedding_type": "colpali_multivector",
+        },
+
+        "response": {
+            "status": "success" if status == "completed" else "failed",
+            "result": result,
+        },
+
+        "error": error,
+    }
+
+    log_path = QUERY_LOG_DIR / f"{query_job_id}.json"
+
+    # Atomic write:
+    # write temporary file first, then replace final file.
+    temp_path = QUERY_LOG_DIR / f".{query_job_id}.tmp"
+
+    with temp_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            log_data,
+            f,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    temp_path.replace(log_path)
+
+    logger.info(
+        "Saved query log: %s",
+        log_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # FastAPI lifecycle
 # ---------------------------------------------------------------------------
@@ -827,6 +1264,66 @@ def get_ingestion_job(job_id: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job not found: {job_id}",
+        )
+
+    return job
+
+
+@app.post(
+    "/query",
+    response_model=AcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_query_job(
+    request: QueryRequest,
+) -> AcceptedResponse:
+
+    query_job_id = new_query_job_id()
+
+    try:
+        query_job_store.create_job(
+            query_job_id=query_job_id,
+            request=request,
+        )
+
+        executor = get_executor()
+
+        executor.submit(
+            _run_query_job,
+            query_job_id,
+            request,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Could not create query job"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not create query job: {exc}",
+        ) from exc
+
+    return AcceptedResponse(
+        job_id=query_job_id,
+        status="accepted",
+        message="Query job accepted.",
+    )
+
+@app.get("/query/{query_job_id}")
+def get_query_job(query_job_id: str) -> dict[str, Any]:
+    if not QUERY_JOB_ID_RE.fullmatch(query_job_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid query_job_id format",
+        )
+
+    job = query_job_store.get_job(query_job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Query job not found: {query_job_id}",
         )
 
     return job
