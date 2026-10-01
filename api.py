@@ -1765,16 +1765,19 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
 
 @app.post(
     "/generate",
-    response_model=AcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
 )
 def create_generate_job(
     request: QueryRequest,
-) -> AcceptedResponse:
+) -> dict[str, Any]:
     """
-    Submit an asynchronous retrieval + answer-generation job.
+    Run retrieval + answer generation synchronously and return only the
+    generated response.
 
     The request contract intentionally matches POST /query.
+
+    A generation job ID is still created internally so the full request,
+    retrieval evidence, generation metadata, timing and errors continue to
+    be persisted to data/generate/<generate_job_id>.json.
     """
     generate_job_id = new_generate_job_id()
 
@@ -1786,31 +1789,51 @@ def create_generate_job(
 
         executor = get_executor()
 
-        # V1 uses the existing single worker. On the 6 GB GPU this means
-        # generation jobs are queued rather than competing for VRAM.
-        executor.submit(
+        # Keep the single-worker executor so GPU-heavy generation remains
+        # serialized on the 6 GB GPU. The HTTP request waits for this job
+        # and returns only the final generated response.
+        future = executor.submit(
             _run_generate_job,
             generate_job_id,
             request,
         )
+        future.result()
 
+        job = generate_job_store.get_job(
+            generate_job_id,
+        )
+
+        if job is None:
+            raise RuntimeError(
+                f"Generation job disappeared: {generate_job_id}"
+            )
+
+        if job["status"] == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=job["error"] or "Generation failed.",
+            )
+
+        if job["status"] != "completed":
+            raise RuntimeError(
+                f"Unexpected generation job status: {job['status']}"
+            )
+
+        # IMPORTANT: POST /generate returns only the model response.
+        return job["result"]
+
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception(
-            "Could not create generation job"
+            "Could not complete generation request %s",
+            generate_job_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                f"Could not create generation job: {exc}"
-            ),
+            detail=f"Generation failed: {exc}",
         ) from exc
-
-    return AcceptedResponse(
-        job_id=generate_job_id,
-        status="accepted",
-        message="Generation job accepted.",
-    )
 
 
 @app.get("/generate/{generate_job_id}")
