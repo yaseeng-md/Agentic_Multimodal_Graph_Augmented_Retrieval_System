@@ -1,19 +1,6 @@
 """
-AMG Multimodal RAG - V1 ingestion API
-======================================
-
-POST   /ingest_document
-GET    /ingest_document/{job_id}
-
-The API is intentionally thin: the existing ingest.py owns PDF ingestion,
-ColPali, duplicate detection, page caching, Qdrant, and the registry.
-This module owns the HTTP contract and asynchronous job tracking.
-
 Run from the same project directory as ingest.py:
     uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
-
-Use ONE Uvicorn worker in V1 because the ingestion pipeline owns a GPU-backed
-ColPali model and the background executor is process-local.
 """
 
 from __future__ import annotations
