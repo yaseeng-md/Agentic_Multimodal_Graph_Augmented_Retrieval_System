@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
@@ -30,6 +30,7 @@ from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
 from query import retrieve
 from generate import generate_answer
+from authorization import AuthContext, authenticate_user, create_user, get_current_user
 
 logger = logging.getLogger("multimodal-rag-api")
 
@@ -1555,6 +1556,63 @@ def save_query_log(
     )
 
 
+class AuthenticatedIngestRequest(IngestRequest):
+    user_id: str
+    organization: str
+    role: str
+
+
+class AuthenticatedQueryRequest(QueryRequest):
+    user_id: str
+    organization: str
+    role: str
+
+
+class CreateUserRequest(BaseModel):
+    name: str = Field(min_length=1)
+    email: str = Field(min_length=3)
+    password: str = Field(min_length=8)
+    organization: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3)
+    password: str = Field(min_length=1)
+
+
+
+def build_authenticated_ingest_request(
+    request: IngestRequest,
+    current_user: AuthContext,
+) -> AuthenticatedIngestRequest:
+
+    return AuthenticatedIngestRequest(
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+        role=current_user.role,
+        s3_links=request.s3_links,
+        local_pdf_paths=request.local_pdf_paths,
+    )
+
+
+def build_authenticated_query_request(
+    request: QueryRequest,
+    current_user: AuthContext,
+) -> AuthenticatedQueryRequest:
+
+    return AuthenticatedQueryRequest(
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+        role=current_user.role,
+        query=request.query,
+        document_ids=request.document_ids,
+        version_ids=request.version_ids,
+        recursive_search=request.recursive_search,
+        top_k=request.top_k,
+    )
+
+
 # ---------------------------------------------------------------------------
 # FastAPI lifecycle
 # ---------------------------------------------------------------------------
@@ -1606,8 +1664,54 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/me")
+def get_me(
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+
+    return current_user.as_dict()
+
+
+@app.post("/create_user")
+def register_user(
+    request: CreateUserRequest,
+) -> dict[str, Any]:
+
+    try:
+        result = create_user(
+            name=request.name,
+            email=request.email,
+            password=request.password,
+            organization=request.organization,
+            role=request.role,
+        )
+
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post("/login")
+def login(
+    request: LoginRequest,
+) -> dict[str, Any]:
+
+    return authenticate_user(
+        email=request.email,
+        password=request.password,
+    )
+
+
+
 @app.get("/list_documents")
-def list_documents() -> dict[str, list[dict[str, Any]]]:
+def list_documents(
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, list[dict[str, Any]]]:
+
     registry = Registry(REGISTRY_DB_PATH)
 
     try:
@@ -1619,7 +1723,9 @@ def list_documents() -> dict[str, list[dict[str, Any]]]:
                 "document_id": row["document_id"],
                 "version_id": row["version_id"],
                 "version_number": row["version_number"],
-                "is_current": bool(row["is_current"]),
+                "is_current": bool(
+                    row["is_current"]
+                ),
             }
             for row in rows
         ]
@@ -1631,51 +1737,75 @@ def list_documents() -> dict[str, list[dict[str, Any]]]:
     finally:
         registry.close()
 
+
 @app.post(
     "/ingest_document",
     response_model=AcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_ingestion_job(request: IngestRequest) -> AcceptedResponse:
+def create_ingestion_job(
+    request: IngestRequest,
+    current_user: AuthContext = Depends(get_current_user),
+) -> AcceptedResponse:
+
+    authenticated_request = (
+        build_authenticated_ingest_request(
+            request,
+            current_user,
+        )
+    )
+
     job_id = new_job_id()
 
     try:
-        # Persist only the original sources here. Local path resolution and S3
-        # download happen in the background so the POST returns immediately.
         files = [
             {
                 "source_type": "s3",
                 "source": url,
-                "filename": Path(urlparse(url).path).name or None,
+                "filename": (
+                    Path(urlparse(url).path).name
+                    or None
+                ),
             }
-            for url in request.s3_links
+            for url in authenticated_request.s3_links
         ]
+
         files.extend(
             {
                 "source_type": "local",
                 "source": path,
                 "filename": Path(path).name,
             }
-            for path in request.local_pdf_paths
+            for path in authenticated_request.local_pdf_paths
         )
 
         job_store.create_job(
             job_id=job_id,
-            user_id=request.user_id,
-            organization=request.organization,
-            role=request.role,
+            user_id=authenticated_request.user_id,
+            organization=authenticated_request.organization,
+            role=authenticated_request.role,
             total_files=len(files),
             files=files,
         )
 
         executor = get_executor()
-        executor.submit(_run_job, job_id, request)
+
+        executor.submit(
+            _run_job,
+            job_id,
+            authenticated_request,
+        )
 
     except Exception as exc:
-        logger.exception("Could not create ingestion job")
+        logger.exception(
+            "Could not create ingestion job"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not create ingestion job: {exc}",
+            detail=(
+                f"Could not create ingestion job: {exc}"
+            ),
         ) from exc
 
     return AcceptedResponse(
@@ -1685,8 +1815,13 @@ def create_ingestion_job(request: IngestRequest) -> AcceptedResponse:
     )
 
 
+
 @app.get("/ingest_document/{job_id}")
-def get_ingestion_job(job_id: str) -> dict[str, Any]:
+def get_ingestion_job(
+    job_id: str,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+
     if not JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1694,10 +1829,17 @@ def get_ingestion_job(job_id: str) -> dict[str, Any]:
         )
 
     job = job_store.get_job(job_id)
+
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job not found: {job_id}",
+        )
+
+    if job["user_id"] != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this job.",
         )
 
     return job
@@ -1710,14 +1852,22 @@ def get_ingestion_job(job_id: str) -> dict[str, Any]:
 )
 def create_query_job(
     request: QueryRequest,
+    current_user: AuthContext = Depends(get_current_user),
 ) -> AcceptedResponse:
+
+    authenticated_request = (
+        build_authenticated_query_request(
+            request,
+            current_user,
+        )
+    )
 
     query_job_id = new_query_job_id()
 
     try:
         query_job_store.create_job(
             query_job_id=query_job_id,
-            request=request,
+            request=authenticated_request,
         )
 
         executor = get_executor()
@@ -1725,7 +1875,7 @@ def create_query_job(
         executor.submit(
             _run_query_job,
             query_job_id,
-            request,
+            authenticated_request,
         )
 
     except Exception as exc:
@@ -1735,7 +1885,9 @@ def create_query_job(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not create query job: {exc}",
+            detail=(
+                f"Could not create query job: {exc}"
+            ),
         ) from exc
 
     return AcceptedResponse(
@@ -1745,7 +1897,11 @@ def create_query_job(
     )
 
 @app.get("/query/{query_job_id}")
-def get_query_job(query_job_id: str) -> dict[str, Any]:
+def get_query_job(
+    query_job_id: str,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+
     if not QUERY_JOB_ID_RE.fullmatch(query_job_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1760,70 +1916,77 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
             detail=f"Query job not found: {query_job_id}",
         )
 
+    if job["user_id"] != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this job.",
+        )
+
     return job
 
-
-@app.post(
-    "/generate",
-)
+@app.post("/generate")
 def create_generate_job(
     request: QueryRequest,
+    current_user: AuthContext = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """
-    Run retrieval + answer generation synchronously and return only the
-    generated response.
 
-    The request contract intentionally matches POST /query.
+    authenticated_request = (
+        build_authenticated_query_request(
+            request,
+            current_user,
+        )
+    )
 
-    A generation job ID is still created internally so the full request,
-    retrieval evidence, generation metadata, timing and errors continue to
-    be persisted to data/generate/<generate_job_id>.json.
-    """
     generate_job_id = new_generate_job_id()
 
     try:
         generate_job_store.create_job(
             generate_job_id=generate_job_id,
-            request=request,
+            request=authenticated_request,
         )
 
         executor = get_executor()
 
-        # Keep the single-worker executor so GPU-heavy generation remains
-        # serialized on the 6 GB GPU. The HTTP request waits for this job
-        # and returns only the final generated response.
         future = executor.submit(
             _run_generate_job,
             generate_job_id,
-            request,
+            authenticated_request,
         )
+
         future.result()
 
         job = generate_job_store.get_job(
-            generate_job_id,
+            generate_job_id
         )
 
         if job is None:
             raise RuntimeError(
-                f"Generation job disappeared: {generate_job_id}"
+                f"Generation job disappeared: "
+                f"{generate_job_id}"
             )
 
         if job["status"] == "failed":
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=job["error"] or "Generation failed.",
+                status_code=(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR
+                ),
+                detail=(
+                    job["error"]
+                    or "Generation failed."
+                ),
             )
 
         if job["status"] != "completed":
             raise RuntimeError(
-                f"Unexpected generation job status: {job['status']}"
+                "Unexpected generation job status: "
+                f"{job['status']}"
             )
 
-        # IMPORTANT: POST /generate returns only the model response.
         return job["result"]
 
     except HTTPException:
         raise
+
     except Exception as exc:
         logger.exception(
             "Could not complete generation request %s",
@@ -1831,7 +1994,9 @@ def create_generate_job(
         )
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
             detail=f"Generation failed: {exc}",
         ) from exc
 
