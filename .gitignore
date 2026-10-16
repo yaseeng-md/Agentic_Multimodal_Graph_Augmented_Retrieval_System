@@ -12,3 +12,5 @@ dummy.py
 /__pycache__
 /.vscode
 debuggers.py
+/.agent-memory
+AGENTS.md
