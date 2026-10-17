@@ -14,3 +14,4 @@ dummy.py
 debuggers.py
 /.agent-memory
 AGENTS.md
+test_server.py
