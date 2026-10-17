@@ -22,15 +22,26 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
 from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
 from query import retrieve
-from generate import generate_answer
-
+from generate import generate_answer, GENERATOR_MODEL
+from redis_manager import (
+    answer_cache_key,
+    cache_get_json,
+    cache_set_json,
+    ensure_redis_running,
+    get_job_state,
+    health_check as redis_health_check,
+    reserve_idempotency,
+    retrieval_cache_key,
+    set_job_state,
+    update_idempotency_status,
+)
 logger = logging.getLogger("multimodal-rag-api")
 
 # ---------------------------------------------------------------------------
@@ -1113,6 +1124,13 @@ def _run_job(job_id: str, request: IngestRequest) -> None:
             error=str(exc),
         )
     finally:
+        # shortcut: sync Redis job cache on state change; upgrade to pubsub/worker queue if scaled
+        try:
+            latest = job_store.get_job(job_id)
+            if latest:
+                set_job_state("ingest", job_id, latest)
+        except Exception:
+            pass
         # The existing ingestion pipeline has already copied the PDF into its
         # permanent PDF_DIR before returning success. Temporary downloads can
         # therefore be removed after the job finishes.
@@ -1140,14 +1158,35 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
     ).isoformat()
 
     try:
-
-        result = retrieve(
+        cache_key = retrieval_cache_key(
+            organization=request.organization,
+            user_id=request.user_id,
+            role=request.role,
             query=request.query,
             document_ids=request.document_ids,
             version_ids=request.version_ids,
             recursive_search=request.recursive_search,
             top_k=request.top_k,
         )
+        result = None
+        try:
+            result = cache_get_json(cache_key)
+        except Exception:
+            result = None
+
+        if result is None:
+            result = retrieve(
+                query=request.query,
+                document_ids=request.document_ids,
+                version_ids=request.version_ids,
+                recursive_search=request.recursive_search,
+                top_k=request.top_k,
+            )
+            # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
+            try:
+                cache_set_json(cache_key, result)
+            except Exception:
+                pass
 
         # Persist result in SQLite
         query_job_store.mark_completed(
@@ -1163,6 +1202,12 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
             if job
             else datetime.now(timezone.utc).isoformat()
         )
+
+        try:
+            if job:
+                set_job_state("query", query_job_id, job)
+        except Exception:
+            pass
 
         # Save complete JSON audit/debug record
         save_query_log(
@@ -1202,6 +1247,12 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
             if job
             else datetime.now(timezone.utc).isoformat()
         )
+
+        try:
+            if job:
+                set_job_state("query", query_job_id, job)
+        except Exception:
+            pass
 
         # Save failed query too
         save_query_log(
@@ -1351,27 +1402,59 @@ def _run_generate_job(
     response: dict[str, Any] | None = None
 
     try:
-        # ---------------------------------------------------------------
-        # Stage 1: existing retrieval
-        # ---------------------------------------------------------------
-        retrieval_result = retrieve(
+        # Stage 1: retrieval (with Redis cache)
+        cache_key = retrieval_cache_key(
+            organization=request.organization,
+            user_id=request.user_id,
+            role=request.role,
             query=request.query,
             document_ids=request.document_ids,
             version_ids=request.version_ids,
             recursive_search=request.recursive_search,
             top_k=request.top_k,
         )
+        try:
+            retrieval_result = cache_get_json(cache_key)
+        except Exception:
+            retrieval_result = None
 
-        # ---------------------------------------------------------------
-        # Stage 2: existing generation layer
-        #
-        # generate_answer() is responsible for the configured GPU lifecycle
-        # including releasing ColPali before Qwen when enabled.
-        # ---------------------------------------------------------------
-        response = generate_answer(
+        if retrieval_result is None:
+            retrieval_result = retrieve(
+                query=request.query,
+                document_ids=request.document_ids,
+                version_ids=request.version_ids,
+                recursive_search=request.recursive_search,
+                top_k=request.top_k,
+            )
+            # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
+            try:
+                cache_set_json(cache_key, retrieval_result)
+            except Exception:
+                pass
+
+        # Stage 2: generation (with Redis answer cache)
+        ans_cache_key = answer_cache_key(
+            organization=request.organization,
+            user_id=request.user_id,
+            role=request.role,
             query=request.query,
             retrieval_result=retrieval_result,
+            model_id=GENERATOR_MODEL,
         )
+        try:
+            response = cache_get_json(ans_cache_key)
+        except Exception:
+            response = None
+
+        if response is None:
+            response = generate_answer(
+                query=request.query,
+                retrieval_result=retrieval_result,
+            )
+            try:
+                cache_set_json(ans_cache_key, response)
+            except Exception:
+                pass
 
         if not isinstance(response, dict):
             raise RuntimeError(
@@ -1392,6 +1475,12 @@ def _run_generate_job(
             if completed_job
             else utc_now()
         )
+
+        try:
+            if completed_job:
+                set_job_state("generate", generate_job_id, completed_job)
+        except Exception:
+            pass
 
         save_generate_log(
             generate_job_id=generate_job_id,
@@ -1430,6 +1519,12 @@ def _run_generate_job(
             if failed_job
             else utc_now()
         )
+
+        try:
+            if failed_job:
+                set_job_state("generate", generate_job_id, failed_job)
+        except Exception:
+            pass
 
         save_generate_log(
             generate_job_id=generate_job_id,
@@ -1565,7 +1660,7 @@ async def lifespan(_: FastAPI):
 
     # Make sure Docker + Qdrant are available before accepting ingestion work.
     start_qdrant()
-
+    ensure_redis_running()
     job_store.recover_running_jobs()
     generate_job_store.recover_running_jobs()
 
@@ -1602,8 +1697,11 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "redis": redis_health_check(),
+    }
 
 
 @app.get("/list_documents")
@@ -1636,8 +1734,37 @@ def list_documents() -> dict[str, list[dict[str, Any]]]:
     response_model=AcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_ingestion_job(request: IngestRequest) -> AcceptedResponse:
+def create_ingestion_job(
+    request: IngestRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> AcceptedResponse:
     job_id = new_job_id()
+    identity = f"{request.organization}:{request.user_id}"
+
+    if idempotency_key:
+        try:
+            res = reserve_idempotency(
+                identity=identity,
+                endpoint="ingest_document",
+                idempotency_key=idempotency_key,
+                payload=request.model_dump(),
+                job_id=job_id,
+            )
+            if res["state"] == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with different request payload.",
+                )
+            if res["state"] == "existing":
+                return AcceptedResponse(
+                    job_id=res["record"]["job_id"],
+                    status="accepted",
+                    message="Ingestion job already accepted (idempotent).",
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Idempotency reservation check failed: %s", exc)
 
     try:
         # Persist only the original sources here. Local path resolution and S3
@@ -1668,6 +1795,18 @@ def create_ingestion_job(request: IngestRequest) -> AcceptedResponse:
             files=files,
         )
 
+        if idempotency_key:
+            try:
+                update_idempotency_status(
+                    identity=identity,
+                    endpoint="ingest_document",
+                    idempotency_key=idempotency_key,
+                    job_id=job_id,
+                    status="queued",
+                )
+            except Exception:
+                pass
+
         executor = get_executor()
         executor.submit(_run_job, job_id, request)
 
@@ -1693,12 +1832,25 @@ def get_ingestion_job(job_id: str) -> dict[str, Any]:
             detail="Invalid job_id format",
         )
 
+    # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
+    try:
+        cached = get_job_state("ingest", job_id)
+        if cached:
+            return cached
+    except Exception:
+        pass
+
     job = job_store.get_job(job_id)
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job not found: {job_id}",
         )
+
+    try:
+        set_job_state("ingest", job_id, job)
+    except Exception:
+        pass
 
     return job
 
@@ -1752,6 +1904,14 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
             detail="Invalid query_job_id format",
         )
 
+    # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
+    try:
+        cached = get_job_state("query", query_job_id)
+        if cached:
+            return cached
+    except Exception:
+        pass
+
     job = query_job_store.get_job(query_job_id)
 
     if job is None:
@@ -1759,6 +1919,11 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Query job not found: {query_job_id}",
         )
+
+    try:
+        set_job_state("query", query_job_id, job)
+    except Exception:
+        pass
 
     return job
 
@@ -1768,6 +1933,7 @@ def get_query_job(query_job_id: str) -> dict[str, Any]:
 )
 def create_generate_job(
     request: QueryRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     """
     Run retrieval + answer generation synchronously and return only the
@@ -1780,6 +1946,37 @@ def create_generate_job(
     be persisted to data/generate/<generate_job_id>.json.
     """
     generate_job_id = new_generate_job_id()
+    identity = f"{request.organization}:{request.user_id}"
+
+    if idempotency_key:
+        try:
+            res = reserve_idempotency(
+                identity=identity,
+                endpoint="generate",
+                idempotency_key=idempotency_key,
+                payload=request.model_dump(),
+                job_id=generate_job_id,
+            )
+            if res["state"] == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with different request payload.",
+                )
+            if res["state"] == "existing":
+                existing_id = res["record"]["job_id"]
+                cached = None
+                try:
+                    cached = get_job_state("generate", existing_id)
+                except Exception:
+                    pass
+                if not cached:
+                    cached = generate_job_store.get_job(existing_id)
+                if cached and cached.get("status") == "completed" and "result" in cached:
+                    return cached["result"]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Idempotency reservation check failed: %s", exc)
 
     try:
         generate_job_store.create_job(
@@ -1818,6 +2015,18 @@ def create_generate_job(
             raise RuntimeError(
                 f"Unexpected generation job status: {job['status']}"
             )
+
+        if idempotency_key:
+            try:
+                update_idempotency_status(
+                    identity=identity,
+                    endpoint="generate",
+                    idempotency_key=idempotency_key,
+                    job_id=generate_job_id,
+                    status="completed",
+                )
+            except Exception:
+                pass
 
         # IMPORTANT: POST /generate returns only the model response.
         return job["result"]
@@ -1860,6 +2069,27 @@ def get_generate_job(
             detail="Invalid generate_job_id format",
         )
 
+    # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
+    try:
+        cached = get_job_state("generate", generate_job_id)
+        if cached:
+            if cached.get("status") in {"queued", "running"}:
+                return {
+                    "job_id": generate_job_id,
+                    "status": cached["status"],
+                }
+            if cached.get("status") == "failed":
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=cached.get("error") or "Generation job failed.",
+                )
+            if cached.get("status") == "completed" and "result" in cached:
+                return cached["result"]
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     job = generate_job_store.get_job(
         generate_job_id,
     )
@@ -1872,6 +2102,11 @@ def get_generate_job(
                 f"{generate_job_id}"
             ),
         )
+
+    try:
+        set_job_state("generate", generate_job_id, job)
+    except Exception:
+        pass
 
     if job["status"] in {"queued", "running"}:
         return {
