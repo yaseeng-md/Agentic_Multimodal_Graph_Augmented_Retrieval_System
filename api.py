@@ -1965,29 +1965,21 @@ def get_ingestion_job(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid job_id format",
         )
-    
-    if job["user_id"] != current_user.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this job.",
-        )
-    
+
     # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
+    cached = None
     try:
         cached = get_job_state("ingest", job_id)
+    except Exception:
+        cached = None
 
-        # Check if the cached job belongs to the current user
-        if cached["user_id"] != current_user.user_id:
+    if cached is not None:
+        if cached.get("user_id") != current_user.user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have access to this job.",
             )
-            
-        if cached:
-            return cached
-    
-    except Exception:
-        pass
+        return cached
 
     # If not found in cache, retrieve from the durable store
     job = job_store.get_job(job_id)
@@ -1997,7 +1989,13 @@ def get_ingestion_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job not found: {job_id}",
         )
-    
+
+    if job.get("user_id") != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this job.",
+        )
+
     try:
         set_job_state("ingest", job_id, job)
     except Exception:
@@ -2367,6 +2365,7 @@ def create_generate_job(
 @app.get("/generate/{generate_job_id}")
 def get_generate_job(
     generate_job_id: str,
+    current_user: AuthContext = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     Poll a generation job.
@@ -2389,25 +2388,30 @@ def get_generate_job(
         )
 
     # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
+    cached = None
     try:
         cached = get_job_state("generate", generate_job_id)
-        if cached:
-            if cached.get("status") in {"queued", "running"}:
-                return {
-                    "job_id": generate_job_id,
-                    "status": cached["status"],
-                }
-            if cached.get("status") == "failed":
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=cached.get("error") or "Generation job failed.",
-                )
-            if cached.get("status") == "completed" and "result" in cached:
-                return cached["result"]
-    except HTTPException:
-        raise
     except Exception:
-        pass
+        cached = None
+
+    if cached is not None:
+        if cached.get("user_id") != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this job.",
+            )
+        if cached.get("status") in {"queued", "running"}:
+            return {
+                "job_id": generate_job_id,
+                "status": cached["status"],
+            }
+        if cached.get("status") == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=cached.get("error") or "Generation job failed.",
+            )
+        if cached.get("status") == "completed" and "result" in cached:
+            return cached["result"]
 
     job = generate_job_store.get_job(
         generate_job_id,
@@ -2420,6 +2424,12 @@ def get_generate_job(
                 f"Generation job not found: "
                 f"{generate_job_id}"
             ),
+        )
+
+    if job.get("user_id") != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this job.",
         )
 
     try:
