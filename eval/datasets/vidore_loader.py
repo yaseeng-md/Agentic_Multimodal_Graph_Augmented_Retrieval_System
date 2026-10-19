@@ -16,15 +16,16 @@ except ImportError as exc:
 logger = logging.getLogger("amg-eval-vidore")
 
 DATASET_ALIASES = {
+    "arxivqa": "vidore/arxivqa_test_subsampled",
     "docvqa": "vidore/docvqa_test_subsampled",
     "infovqa": "vidore/infovqa_test_subsampled",
-    "arxivqa": "vidore/arxivqa_test_subsampled",
-    "tabf_factual": "vidore/tabf_factual",
-    "tabfact": "vidore/tabf_factual",
+    "tabfquad": "vidore/tabfquad_test_subsampled",
+    "tatdqa": "vidore/tatdqa_test",
     "shiftproject": "vidore/shiftproject_test",
-    "ai": "vidore/artificial_intelligence_test",
-    "energy": "vidore/energy_test",
-    "economics": "vidore/economics_test",
+    "ai": "vidore/syntheticDocQA_artificial_intelligence_test",
+    "energy": "vidore/syntheticDocQA_energy_test",
+    "government": "vidore/syntheticDocQA_government_reports_test",
+    "healthcare": "vidore/syntheticDocQA_healthcare_industry_test",
 }
 
 
