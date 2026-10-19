@@ -7,8 +7,11 @@ import logging
 from pathlib import Path
 import sys
 
-# Ensure repo root is on sys.path
+# Ensure repo root is on sys.path and remove script dir to avoid shadowing HuggingFace 'datasets'
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) in sys.path:
+    sys.path.remove(str(_SCRIPT_DIR))
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 

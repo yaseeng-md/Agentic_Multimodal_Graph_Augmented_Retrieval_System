@@ -39,6 +39,12 @@ DEFAULT_CUTOFFS = (1, 3, 5, 10)
 REPORTS_DIR = ROOT_DIR / "reports" / "vidore"
 CACHE_DIR = ROOT_DIR / "data" / "eval_cache"
 
+# OpenRouter LLM-as-a-Judge Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip() or None
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+JUDGE_TIMEOUT_SEC = int(os.getenv("JUDGE_TIMEOUT_SEC", "30"))
+
 
 @dataclass(frozen=True)
 class EvalConfig:
