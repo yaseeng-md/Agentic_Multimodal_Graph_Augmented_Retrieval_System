@@ -198,13 +198,41 @@ def run_benchmark():
     print("\n" + md_report + "\n")
 
     # 6. Save Reports
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    slug = dataset.dataset_name.replace("/", "_")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = args.output_dir / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    slug = dataset.dataset_name.replace("/", "_")
 
-    json_path = args.output_dir / f"{slug}_{ts}.json"
-    md_path = args.output_dir / f"{slug}_{ts}.md"
+    json_path = run_dir / f"{slug}_report.json"
+    md_path = run_dir / f"{slug}_scorecard.md"
     latest_md_path = args.output_dir / "latest_scorecard.md"
+
+    # Assemble detailed per-sample records: query, desired results, retrieval outputs, and metadata
+    sample_records = []
+    for qid, qtext in dataset.queries.items():
+        desired_doc_ids = [doc_id for doc_id, rel in dataset.qrels.get(qid, {}).items() if rel > 0]
+        retrieved_items = [
+            {
+                "rank": rank,
+                "doc_id": doc_id,
+                "score": round(score, 4),
+                "is_hit": doc_id in desired_doc_ids,
+            }
+            for rank, (doc_id, score) in enumerate(run_results.get(qid, []), start=1)
+        ]
+        meta = dataset.metadata.get(qid, {})
+        sample_records.append(
+            {
+                "sample_id": qid,
+                "query": qtext,
+                "desired_result": {
+                    "relevant_doc_ids": desired_doc_ids,
+                    "ground_truth_answer": meta.get("answer"),
+                },
+                "retrieval_output": retrieved_items,
+                "sample_metadata": meta,
+            }
+        )
 
     report_payload = {
         "timestamp": datetime.now().isoformat(),
@@ -215,6 +243,7 @@ def run_benchmark():
         "num_corpus": dataset.num_documents,
         "metrics": metrics,
         "stats": stats,
+        "samples": sample_records,
     }
 
     with open(json_path, "w", encoding="utf-8") as f:

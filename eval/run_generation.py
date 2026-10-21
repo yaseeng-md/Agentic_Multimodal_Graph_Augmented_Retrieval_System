@@ -197,12 +197,13 @@ def run_eval():
     print("\n" + scorecard_md + "\n")
 
     # 5. Save Reports
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = f"{args.dataset}_{args.config}_{ts}"
+    run_dir = args.output_dir / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    slug = f"{args.dataset}_{args.config}"
 
-    json_path = args.output_dir / f"{slug}.json"
-    md_path = args.output_dir / f"{slug}.md"
+    json_path = run_dir / f"{slug}_report.json"
+    md_path = run_dir / f"{slug}_scorecard.md"
     latest_path = args.output_dir / "latest_scorecard.md"
 
     report_payload = {
@@ -215,6 +216,7 @@ def run_eval():
         "num_samples": len(predictions),
         "avg_latency_ms": avg_latency,
         "metrics": metrics,
+        "samples": eval_results["sample_scores"],
         "sample_scores": eval_results["sample_scores"],
     }
 

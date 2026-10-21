@@ -40,9 +40,11 @@ The AMG Evaluation Suite provides automated, standardized benchmarking for both 
    └──────────────────┬──────────────────┘                                   │     • Lexical: BLEU-4, ROUGE-L, F1  │
                       │                                                      └──────────────────┬──────────────────┘
                       ▼                                                                         ▼
-   ┌─────────────────────────────────────┐                                   ┌─────────────────────────────────────┐
-   │     reports/vidore/<timestamp>.md   │                                   │   reports/generation/<timestamp>.md │
-   └─────────────────────────────────────┘                                   └─────────────────────────────────────┘
+   ┌─────────────────────────────────────────┐                           ┌─────────────────────────────────────────┐
+   │ reports/vidore/<timestamp>/             │                           │ reports/generation/<timestamp>/         │
+   │ • <dataset>_scorecard.md                │                           │ • <dataset>_<config>_scorecard.md       │
+   │ • <dataset>_report.json                 │                           │ • <dataset>_<config>_report.json        │
+   └─────────────────────────────────────────┘                           └─────────────────────────────────────────┘
 ```
 
 ### Key Principles & Design Decisions
@@ -206,10 +208,11 @@ python eval/run_generation.py --dataset openrag --config hotpotqa --mode given_c
 
 ## 5. Report Artifacts & Historical Logging
 
-All benchmark executions produce two synchronized artifacts in the report directories:
+All benchmark executions produce two synchronized artifacts in dedicated timestamped subdirectories:
+`reports/<suite>/<timestamp>/` (e.g. `reports/vidore/20261021_112030/` or `reports/generation/20261021_112030/`).
 
 ### 5.1 Timestamped Markdown Scorecards
-Saved to `reports/<suite>/<dataset>_<config>_YYYYMMDD_HHMMSS.md`.
+Saved to `reports/<suite>/<timestamp>/<dataset>_scorecard.md`. Also duplicated to `reports/<suite>/latest_scorecard.md` for quick inspection.
 
 Example output:
 ```markdown
@@ -241,7 +244,25 @@ Example output:
 ```
 
 ### 5.2 Structured JSON Run Logs
-Saved alongside the scorecard as `reports/<suite>/<dataset>_<config>_YYYYMMDD_HHMMSS.json`. Contains raw inputs, outputs, latencies, per-sample scores, and judge reasoning for programmatic diffing and historical dashboards.
+Saved alongside the scorecard as `reports/<suite>/<timestamp>/<dataset>_report.json`.
+
+Contains full benchmark telemetry, aggregate scores, and detailed per-sample records:
+1. **ViDoRe Retrieval JSON**:
+   - `timestamp`, `dataset`, `model`, `quantization`, `metrics` (`Recall@K`, `MRR@K`, `nDCG@K`), `stats`.
+   - `samples`: List of sample objects containing:
+     - `sample_id` & `query`
+     - `desired_result`: `relevant_doc_ids` and `ground_truth_answer`
+     - `retrieval_output`: Ranked candidates with `rank`, `doc_id`, `score`, and `is_hit` boolean
+     - `sample_metadata`: Image filename, source, page, data split
+2. **Generation & Judge JSON**:
+   - `timestamp`, `dataset`, `config`, `mode`, `model`, `judge`, `metrics`, `avg_latency_ms`.
+   - `samples`: List of sample objects containing:
+     - `sample_id` & `query`
+     - `desired_result`: `ground_truth` and `gold_contexts`
+     - `generation_output`: `answer` and `latency_ms`
+     - `retrieval_output`: `retrieved_sources` and `contexts` provided to model
+     - `judge_evaluation`: `faithfulness`, `relevancy`, `context_precision`, `exact_match`, `f1`, `rouge_l`, `bleu_4`
+     - `sample_metadata`: Document titles, multi-hop info, and dataset tags
 
 ---
 

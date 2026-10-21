@@ -83,6 +83,31 @@ class RagasEvaluator:
                 {
                     "sample_id": p.get("sample_id"),
                     "query": query,
+                    "desired_result": {
+                        "ground_truth": gold_text,
+                        "ground_truth_candidates": candidates,
+                        "gold_contexts": p.get("gold_contexts", []),
+                    },
+                    "generation_output": {
+                        "answer": answer,
+                        "latency_ms": p.get("latency_ms", 0),
+                    },
+                    "retrieval_output": {
+                        "retrieved_sources": p.get("retrieved_sources", []),
+                        "contexts": contexts,
+                    },
+                    "judge_evaluation": {
+                        "faithfulness": faith_score,
+                        "relevancy": rel_score,
+                        "context_precision": prec_score,
+                        "exact_match": best_em,
+                        "f1": best_f1,
+                        "rouge_l": best_rouge,
+                        "bleu_4": best_bleu,
+                    },
+                    "sample_metadata": p.get("metadata", {}),
+                    "is_multimodal": p.get("is_multimodal", False),
+                    # Direct top-level access for backward compatibility
                     "answer": answer,
                     "ground_truth": gold_text,
                     "faithfulness": faith_score,
