@@ -232,6 +232,10 @@ class QueryRequest(BaseModel):
 
     top_k: int = Field(default=5, ge=1)
 
+    enable_rerank: bool = False
+    rerank_threshold: float = 0.75
+    retrieval_top_k: int = 20
+
     @field_validator("user_id", "organization", "role", "query")
     @classmethod
     def strip_required_strings(cls, value: str) -> str:
@@ -1183,6 +1187,9 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
                 version_ids=request.version_ids,
                 recursive_search=request.recursive_search,
                 top_k=request.top_k,
+                enable_rerank=getattr(request, "enable_rerank", False),
+                rerank_threshold=getattr(request, "rerank_threshold", 0.75),
+                retrieval_top_k=getattr(request, "retrieval_top_k", 20),
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:
@@ -1427,6 +1434,9 @@ def _run_generate_job(
                 version_ids=request.version_ids,
                 recursive_search=request.recursive_search,
                 top_k=request.top_k,
+                enable_rerank=getattr(request, "enable_rerank", False),
+                rerank_threshold=getattr(request, "rerank_threshold", 0.75),
+                retrieval_top_k=getattr(request, "retrieval_top_k", 20),
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:

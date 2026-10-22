@@ -42,6 +42,12 @@ from transformers import (
 
 # Existing retrieval implementation.
 from query import retrieve, release_query_encoder
+from utils.reranker import (
+    DEFAULT_RERANK_GENERATION_TOP_K,
+    DEFAULT_RERANK_RELEVANCE_THRESHOLD,
+    DEFAULT_RERANK_RETRIEVAL_TOP_K,
+    JinaReranker,
+)
 
 
 load_dotenv()
@@ -194,6 +200,27 @@ GENERATOR_TEMPERATURE = float(
 
 GENERATOR_TOP_P = float(
     os.getenv("GENERATOR_TOP_P", "0.9")
+)
+
+# ---------------------------------------------------------------------------
+# Multimodal Reranking (jina-reranker-m0)
+# ---------------------------------------------------------------------------
+
+GENERATOR_ENABLE_RERANK = _env_bool(
+    "GENERATOR_ENABLE_RERANK",
+    False,
+)
+
+GENERATOR_RERANK_RETRIEVAL_TOP_K = int(
+    os.getenv("GENERATOR_RERANK_RETRIEVAL_TOP_K", str(DEFAULT_RERANK_RETRIEVAL_TOP_K))
+)
+
+GENERATOR_RERANK_THRESHOLD = float(
+    os.getenv("GENERATOR_RERANK_THRESHOLD", str(DEFAULT_RERANK_RELEVANCE_THRESHOLD))
+)
+
+GENERATOR_RERANK_TOP_K = int(
+    os.getenv("GENERATOR_RERANK_TOP_K", str(DEFAULT_RERANK_GENERATION_TOP_K))
 )
 
 
@@ -845,20 +872,55 @@ def query_and_generate(
     version_ids: Optional[Sequence[str]] = None,
     recursive_search: bool = False,
     top_k: int = 5,
+    enable_rerank: Optional[bool] = None,
+    rerank_threshold: Optional[float] = None,
+    retrieval_top_k: Optional[int] = None,
 ) -> dict[str, Any]:
     """
-    Existing retrieve() -> optional ColPali release -> Qwen generation.
+    Multimodal generation pipeline:
+    1. Retrieval with ColPali (retrieving top-20 if reranking is enabled).
+    2. Optional Jina multimodal reranking (jina-reranker-m0) filtering by relevance score >= 0.75,
+       selecting the top 5 candidates for generation.
+    3. GPU memory cleanup (release ColPali encoder).
+    4. Qwen3-VL-2B-Instruct multimodal grounded generation.
     """
+    should_rerank = GENERATOR_ENABLE_RERANK if enable_rerank is None else enable_rerank
+    cutoff_threshold = GENERATOR_RERANK_THRESHOLD if rerank_threshold is None else rerank_threshold
+
+    fetch_top_k = (retrieval_top_k or GENERATOR_RERANK_RETRIEVAL_TOP_K) if should_rerank else top_k
+
     retrieval_result = retrieve(
         query=query,
         document_ids=document_ids,
         version_ids=version_ids,
         recursive_search=recursive_search,
-        top_k=top_k,
+        top_k=fetch_top_k,
     )
 
+    rerank_metadata: dict[str, Any] = {}
+    if should_rerank:
+        reranker = JinaReranker()
+        reranked_pages, rerank_ms = reranker.rerank_retrieval_results(
+            query=query,
+            retrieval_candidates=retrieval_result.get("results", []),
+            threshold=cutoff_threshold,
+            top_k=min(top_k, GENERATOR_RERANK_TOP_K),
+        )
+        rerank_metadata = {
+            "reranked": True,
+            "model": reranker.model,
+            "initial_candidates_count": len(retrieval_result.get("results", [])),
+            "final_candidates_count": len(reranked_pages),
+            "threshold": cutoff_threshold,
+            "latency_ms": round(rerank_ms, 2),
+        }
+        retrieval_result["results"] = reranked_pages
+        retrieval_result["result_count"] = len(reranked_pages)
+        retrieval_result["rerank"] = rerank_metadata
+
     logger.info(
-        "Retrieval completed. GPU memory: %s",
+        "Retrieval completed (rerank=%s). GPU memory: %s",
+        should_rerank,
         _cuda_memory_snapshot(),
     )
 
@@ -878,10 +940,14 @@ def query_and_generate(
         retrieval_result=retrieval_result,
     )
 
+    res_dict = asdict(generation_result)
+    if rerank_metadata and "generation" in res_dict:
+        res_dict["generation"]["rerank"] = rerank_metadata
+
     return {
         "query": query,
         "retrieval": retrieval_result,
-        "response": asdict(generation_result),
+        "response": res_dict,
     }
 
 
@@ -977,6 +1043,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        help="Enable multimodal reranking using jina-reranker-m0 before generation.",
+    )
+
+    parser.add_argument(
+        "--rerank-threshold",
+        type=float,
+        default=DEFAULT_RERANK_RELEVANCE_THRESHOLD,
+        help=f"Relevance score cutoff threshold for reranking (default: {DEFAULT_RERANK_RELEVANCE_THRESHOLD}).",
+    )
+
+    parser.add_argument(
+        "--retrieval-top-k",
+        type=int,
+        default=DEFAULT_RERANK_RETRIEVAL_TOP_K,
+        help=f"Candidates to retrieve initially before reranking (default: {DEFAULT_RERANK_RETRIEVAL_TOP_K}).",
+    )
+
+    parser.add_argument(
         "--output",
         default="generation_result.json",
         help="Optional JSON output file.",
@@ -1002,6 +1088,9 @@ def main() -> None:
         version_ids=args.version_ids,
         recursive_search=args.recursive_search,
         top_k=args.top_k,
+        enable_rerank=args.enable_rerank,
+        rerank_threshold=args.rerank_threshold,
+        retrieval_top_k=args.retrieval_top_k,
     )
 
     print(

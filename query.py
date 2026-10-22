@@ -68,6 +68,13 @@ except ImportError as exc:  # pragma: no cover - environment dependent
         "Install the same ColPali dependency used by the ingestion pipeline."
     ) from exc
 
+from utils.reranker import (
+    DEFAULT_RERANK_GENERATION_TOP_K,
+    DEFAULT_RERANK_RELEVANCE_THRESHOLD,
+    DEFAULT_RERANK_RETRIEVAL_TOP_K,
+    JinaReranker,
+)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -460,9 +467,12 @@ def retrieve(
     version_ids: Optional[Sequence[str]] = None,
     recursive_search: bool = False,
     top_k: int = 5,
+    enable_rerank: bool = False,
+    rerank_threshold: float = DEFAULT_RERANK_RELEVANCE_THRESHOLD,
+    retrieval_top_k: int = DEFAULT_RERANK_RETRIEVAL_TOP_K,
 ) -> dict[str, Any]:
     """
-    Retrieve the top-k relevant PDF pages for a text query.
+    Retrieve the top-k relevant PDF pages for a text query, with optional Jina multimodal reranking.
 
     Parameters
     ----------
@@ -477,7 +487,14 @@ def retrieve(
         If True, ignore document_ids/version_ids and search every version of
         every document.
     top_k:
-        Number of ranked pages to return.
+        Number of ranked pages to return (post-rerank if enabled).
+    enable_rerank:
+        If True, retrieves initial candidates (default: 20) with ColPali and reranks
+        them with jina-reranker-m0, applying the relevance score threshold.
+    rerank_threshold:
+        Relevance score threshold for reranked candidates (default: 0.75).
+    retrieval_top_k:
+        Number of candidates to retrieve initially before reranking (default: 20).
 
     Returns
     -------
@@ -496,9 +513,11 @@ def retrieve(
         recursive_search=recursive_search,
     )
 
+    fetch_limit = max(top_k, retrieval_top_k) if enable_rerank else top_k
+
     print(f"[Retrieval] Query: {query}")
     print(f"[Retrieval] Scope: {scope.mode}")
-    print(f"[Retrieval] Top-K: {top_k}")
+    print(f"[Retrieval] Top-K: {top_k} (Fetch limit: {fetch_limit}, Rerank: {enable_rerank})")
 
     encoder = get_query_encoder()
     query_embedding = encoder.encode(query)
@@ -513,7 +532,7 @@ def retrieve(
         query=query_embedding,
         using=QDRANT_VECTOR_NAME,
         query_filter=query_filter,
-        limit=top_k,
+        limit=fetch_limit,
         with_payload=True,
         with_vectors=False,
     )
@@ -523,7 +542,25 @@ def retrieve(
         for index, point in enumerate(response.points, start=1)
     ]
 
-    return {
+    rerank_metadata: dict[str, Any] = {}
+    if enable_rerank:
+        reranker = JinaReranker()
+        reranked_results, rerank_latency = reranker.rerank_retrieval_results(
+            query=query,
+            retrieval_candidates=results,
+            threshold=rerank_threshold,
+            top_k=top_k,
+        )
+        rerank_metadata = {
+            "reranked": True,
+            "rerank_model": reranker.model,
+            "rerank_threshold": rerank_threshold,
+            "retrieval_candidates_count": len(results),
+            "rerank_latency_ms": round(rerank_latency, 2),
+        }
+        results = reranked_results
+
+    response_payload: dict[str, Any] = {
         "query": query,
         "top_k": top_k,
         "scope": {
@@ -535,6 +572,10 @@ def retrieve(
         "result_count": len(results),
         "results": results,
     }
+    if rerank_metadata:
+        response_payload["rerank"] = rerank_metadata
+
+    return response_payload
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +616,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of results to return (default: 5).",
     )
+    parser.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        help="Enable multimodal reranking using jina-reranker-m0.",
+    )
+    parser.add_argument(
+        "--rerank-threshold",
+        type=float,
+        default=DEFAULT_RERANK_RELEVANCE_THRESHOLD,
+        help=f"Relevance score cutoff threshold for reranking (default: {DEFAULT_RERANK_RELEVANCE_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--retrieval-top-k",
+        type=int,
+        default=DEFAULT_RERANK_RETRIEVAL_TOP_K,
+        help=f"Number of candidates to retrieve initially before reranking (default: {DEFAULT_RERANK_RETRIEVAL_TOP_K}).",
+    )
 
     return parser
 
@@ -589,6 +647,9 @@ def main() -> None:
         version_ids=args.version_ids,
         recursive_search=args.recursive_search,
         top_k=args.top_k,
+        enable_rerank=args.enable_rerank,
+        rerank_threshold=args.rerank_threshold,
+        retrieval_top_k=args.retrieval_top_k,
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))

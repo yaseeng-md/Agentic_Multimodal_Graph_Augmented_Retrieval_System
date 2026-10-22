@@ -47,6 +47,9 @@ amg/
 ├── registry.py               # SQLite persistence layer for documents, versions, and page hashes
 ├── qdrant_store.py           # Qdrant client abstraction for multi-vector late-interaction collections
 ├── test_server.py            # Comprehensive end-to-end test suite (11 endpoints, auth, idempotency)
+├── utils/
+│   ├── reranker.py           # Jina AI multimodal reranker integration (jina-reranker-m0)
+│   └── visual_grounding.py   # Patch cross-attention mapping, bounding box extraction & heatmap overlays
 ├── documentation/            # In-depth architectural references and pipeline specifications
 │   ├── v1_ingest.md          # Ingestion pipeline specifications and edge cases
 │   ├── v1_query.md           # Retrieval pipeline specifications and scoring logic
@@ -69,6 +72,7 @@ amg/
 
 - **Zero-OCR Visual Pipeline**: Reads documents exactly as humans see them by rendering pages to 150 DPI PNGs via PyMuPDF.
 - **ColPali v1.3 Multi-Vector Search**: Encodes visual document pages into patch-level multi-vectors ($1024 \times 128$) and calculates late-interaction `MAX_SIM` directly inside Qdrant.
+- **Two-Stage Visual Reranking (`jina-reranker-m0`)**: Optional second-stage multimodal cross-encoder reranking via Jina AI API. Evaluates full-resolution page images as base64 against user queries, filters noise with a $0.75$ relevance threshold, and selects the top 5 most relevant pages for generation.
 - **Document Versioning & Scoping**: Built-in SQLite registry handles document versioning (`is_current` flags). Queries can target specific documents, exact versions, or recursively traverse history.
 - **Grounded Vision-Language Generation**: `Qwen3-VL-2B-Instruct` ingests high-resolution page context directly, providing grounded, hallucination-resistant answers with page citations.
 - **6 GB VRAM Hardware Lifecycle**: Sequential model loading, proactive CUDA cache eviction, and explicit model unloading (`release_query_encoder()` and `unload_generator()`) allow running both heavy models on a single consumer GPU (e.g., RTX 3060 / 4050 6GB).
@@ -218,7 +222,55 @@ Visual Document Retrieval is benchmarked on the official **ViDoRe v3 (Visual Doc
 | **Average Latency** | **77.41 ms** | $\le 150\text{ ms}$ | High-throughput sub-100ms multi-vector late-interaction retrieval |
 | **Total Benchmark Time** | **7.76 s** | — | Total duration for all 100 queries |
 
-### 2. OpenRAG Generation Benchmark
+### 2. Multimodal Reranking Evaluation: ColPali vs. Jina Reranker m0
+
+To evaluate whether second-stage cross-encoder reranking is efficient and advantageous for our visual document RAG pipeline, AMG implements a dual-evaluation harness that runs retrieval **without reranking** and **with reranking** (`jina-reranker-m0` on top-20 retrieved page candidates sending base64 images).
+
+- **Benchmark Dataset**: `vidore/arxivqa_test_subsampled` (ArXivQA)
+- **First-Stage Embedder**: `vidore/colpali-v1.3-merged` (4-bit NF4 late-interaction in Qdrant)
+- **Second-Stage Reranker**: `jina-reranker-m0` (Multimodal Vision-Language Cross-Encoder via Jina AI API)
+- **Retrieval Depth**: Top-20 initial candidate pages per query
+- **Relevance Score Threshold**: `0.75` (only candidates with score $\ge 0.75$ retained, capped at top-5 for generation)
+- **Report & Scorecard**: [`reports/vidore/latest_rerank_comparison.md`](reports/vidore/latest_rerank_comparison.md)
+
+#### Comparative Benchmark Results (25 Queries, ArXivQA)
+
+| Metric | Without Reranking (ColPali) | With Reranking (ColPali + Jina m0) | Delta (Abs) | Rel Improvement (%) | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Recall@1** | 0.8000 | **0.8400** | **+0.0400** | **+5.00%** | Ground-truth page placed at rank #1 |
+| **Recall@3** | 0.8000 | **0.9600** | **+0.1600** | **+20.00%** | Ground-truth page within top 3 candidates |
+| **Recall@5** | 0.9200 | **0.9600** | **+0.0400** | **+4.35%** | Ground-truth page within top 5 candidates |
+| **Recall@10** | 0.9200 | **0.9600** | **+0.0400** | **+4.35%** | Ground-truth page within top 10 candidates |
+| **Recall@20** | 0.9600 | **0.9600** | 0.0000 | 0.00% | Ground-truth page within initial top 20 pool |
+| **MRR@20** | 0.8336 | **0.8933** | **+0.0597** | **+7.16%** | Mean Reciprocal Rank at cutoff 20 |
+| **nDCG@20** | 0.8628 | **0.9105** | **+0.0477** | **+5.53%** | Normalized Discounted Cumulative Gain at 20 |
+
+#### Efficiency & Latency Breakdown
+
+| Pipeline Stage | Avg Latency / Query | Total Duration | Throughput | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **ColPali Vector Search** | **112.45 ms** | 2.82 s | 8.9 q/s | Multi-vector late-interaction `MAX_SIM` in Qdrant (top-20) |
+| **Jina Reranker API** | **3942.60 ms** | 98.57 s | 0.25 q/s | Vision-language cross-encoder on 20 base64 page images |
+| **Total End-to-End** | **4055.05 ms** | 101.39 s | 0.25 q/s | Combined two-stage retrieval + rerank pipeline |
+
+#### Thresholding & Context Pruning ($\ge 0.75$, Top-5)
+
+- **100% of queries** had at least 1 document exceeding the $0.75$ relevance score threshold.
+- On average, only **1.84 documents** per query met the threshold (out of 20 retrieved).
+- **~90% of noise and distracting pages were successfully pruned** prior to generation.
+
+#### Architecture Decision: Is Reranking a Good Decision for Our Use Case?
+
+> [!IMPORTANT]
+> **Verdict: YES for High-Fidelity Multimodal Generation, NO for Low-Latency Interactive Search.**
+> 
+> 1. **Massive Quality Gain for Generation**: Reranking boosts **Recall@3 by +20.0%** and **MRR by +7.16%**, while pruning distracting context pages from 20 down to an average of **1.84 highly relevant pages**. This dramatically cuts hallucinations in `Qwen3-VL-2B`.
+> 2. **Latency Trade-Off**: ColPali alone responds in **~112 ms**, whereas transmitting 20 base64 images over the network to Jina AI's cross-encoder takes **~3.9 seconds**.
+> 3. **Recommended Production Hybrid**:
+>    - For fast search / document discovery: Use ColPali baseline (`enable_rerank=False`, sub-150ms response).
+>    - For deep question answering and report generation: Enable Jina reranking (`enable_rerank=True`, retrieve top-20 $\rightarrow$ rerank $\rightarrow$ threshold $\ge 0.75$ $\rightarrow$ top-5 to Qwen).
+
+### 3. OpenRAG Generation Benchmark
 
 Generation quality is measured using **OpenRAG** (e.g. HotpotQA, 2WikiMultihopQA) using an **LLM-as-a-Judge** (via OpenRouter, default: `nvidia/nemotron-3.5-super-vl:free` or `openai/gpt-4o-mini`) alongside standard lexical metrics:
 
@@ -230,8 +282,11 @@ Generation quality is measured using **OpenRAG** (e.g. HotpotQA, 2WikiMultihopQA
 ### Running Evaluations
 
 ```bash
-# Run ViDoRe v3 Retrieval Benchmark (100 samples)
+# Run ViDoRe v3 Retrieval Benchmark (Baseline ColPali)
 python eval/run_vidore.py --dataset arxivqa --sample 100
+
+# Run Dual-Mode Benchmark (Without Reranking vs. With Jina Reranker m0)
+python eval/run_vidore.py --dataset arxivqa --sample 25 --rerank
 
 # Run OpenRAG Generation Benchmark with LLM-as-a-judge
 python eval/run_generation.py --dataset openrag --config hotpotqa --sample 10
@@ -350,6 +405,9 @@ python ingest.py --dummy-test
 # Retrieve top-5 relevant pages across all current documents
 python query.py --query "What are the performance metrics on ArXivQA?" --top-k 5
 
+# Retrieve with Jina multimodal reranking (jina-reranker-m0, threshold 0.75)
+python query.py --query "What are the performance metrics on ArXivQA?" --top-k 5 --enable-rerank
+
 # Scoped retrieval targeting a specific document
 python query.py --query "Summarize chapter 2" --document-id doc_472b4946-f9ba-4bf0 --top-k 3
 
@@ -360,11 +418,18 @@ python query.py --query "Find previous revisions of the budget table" --recursiv
 ### 3. Generation CLI ([`generate.py`])
 
 ```bash
-# End-to-end retrieve and generate grounded answer
+# End-to-end retrieve and generate grounded answer (baseline ColPali)
 python generate.py \
   --query "What is ColPali and how does late interaction work?" \
   --top-k 3 \
   --output result.json
+
+# End-to-end retrieve, rerank with Jina m0 (top-20 -> threshold 0.75 -> top-5), and generate
+python generate.py \
+  --query "What is ColPali and how does late interaction work?" \
+  --enable-rerank \
+  --top-k 5 \
+  --output result_reranked.json
 ```
 
 ---
@@ -604,7 +669,9 @@ curl -X POST http://localhost:8000/generate \
     "document_ids": [],
     "version_ids": [],
     "recursive_search": false,
-    "top_k": 3
+    "top_k": 5,
+    "enable_rerank": true,
+    "rerank_threshold": 0.75
   }'
 ```
 
@@ -616,26 +683,17 @@ curl -X POST http://localhost:8000/generate \
     {
       "source_id": "S1",
       "rank": 1,
-      "score": 0.9412,
+      "score": 0.9888,
       "document_id": "doc_e3f28d8b-821c-4b53-9c02-76326bb178d2",
       "version_id": "ver_01f92e3a-0e92-411a-b328-9842bf27ce52",
       "version_number": 1,
       "filename": "financial_report_2025.pdf",
       "page_number": 8,
       "page_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90...",
-      "page_image_path": "/home/user/amg/data/pages/doc_e3f28d8b/ver_01f92e3a/page_8.png"
-    },
-    {
-      "source_id": "S2",
-      "rank": 2,
-      "score": 0.8875,
-      "document_id": "doc_e3f28d8b-821c-4b53-9c02-76326bb178d2",
-      "version_id": "ver_01f92e3a-0e92-411a-b328-9842bf27ce52",
-      "version_number": 1,
-      "filename": "financial_report_2025.pdf",
-      "page_number": 9,
-      "page_hash": "b2c3d4e5f60718293a4b5c6d7e8f90a1...",
-      "page_image_path": "/home/user/amg/data/pages/doc_e3f28d8b/ver_01f92e3a/page_9.png"
+      "page_image_path": "/home/user/amg/data/pages/doc_e3f28d8b/ver_01f92e3a/page_8.png",
+      "reranked": true,
+      "original_rank": 2,
+      "original_score": 0.9124
     }
   ],
   "generation": {
@@ -643,6 +701,25 @@ curl -X POST http://localhost:8000/generate \
     "prequantized": false,
     "quantization": "bitsandbytes_4bit_nf4",
     "compute_dtype": "bfloat16",
+    "context_pages": 1,
+    "images_used": 1,
+    "min_pixels": 262144,
+    "max_pixels": 524288,
+    "max_new_tokens": 256,
+    "duration_ms": 3412.85,
+    "retrieval_scope": "latest_versions",
+    "retrieval_result_count": 1,
+    "rerank": {
+      "reranked": true,
+      "model": "jina-reranker-m0",
+      "initial_candidates_count": 20,
+      "final_candidates_count": 1,
+      "threshold": 0.75,
+      "latency_ms": 3840.12
+    }
+  }
+}
+```
     "context_pages": 3,
     "images_used": 3,
     "min_pixels": 262144,
