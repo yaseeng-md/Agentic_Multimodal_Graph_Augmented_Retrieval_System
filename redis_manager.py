@@ -514,6 +514,7 @@ def retrieval_cache_key(
     version_ids: Sequence[str] = (),
     recursive_search: bool = False,
     top_k: int = 5,
+    enable_bbox: bool = False,
     corpus_revision: str | None = None,
 ) -> str:
     """Build a tenant/user-scoped retrieval key; pass current version IDs/revision.
@@ -530,6 +531,7 @@ def retrieval_cache_key(
         "version_ids": sorted(set(version_ids)),
         "recursive_search": bool(recursive_search),
         "top_k": int(top_k),
+        "enable_bbox": bool(enable_bbox),
         "corpus_revision": corpus_revision,
     }
     return make_cache_key("retrieval", payload)

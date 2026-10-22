@@ -231,6 +231,7 @@ class QueryRequest(BaseModel):
     recursive_search: bool = False
 
     top_k: int = Field(default=5, ge=1)
+    enable_bbox: bool = False
 
     @field_validator("user_id", "organization", "role", "query")
     @classmethod
@@ -1169,6 +1170,7 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
             version_ids=request.version_ids,
             recursive_search=request.recursive_search,
             top_k=request.top_k,
+            enable_bbox=request.enable_bbox,
         )
         result = None
         try:
@@ -1183,6 +1185,7 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
                 version_ids=request.version_ids,
                 recursive_search=request.recursive_search,
                 top_k=request.top_k,
+                include_bbox=request.enable_bbox,
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:
@@ -1414,6 +1417,7 @@ def _run_generate_job(
             version_ids=request.version_ids,
             recursive_search=request.recursive_search,
             top_k=request.top_k,
+            enable_bbox=request.enable_bbox,
         )
         try:
             retrieval_result = cache_get_json(cache_key)
@@ -1427,6 +1431,7 @@ def _run_generate_job(
                 version_ids=request.version_ids,
                 recursive_search=request.recursive_search,
                 top_k=request.top_k,
+                include_bbox=request.enable_bbox,
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:
@@ -1452,6 +1457,7 @@ def _run_generate_job(
             response = generate_answer(
                 query=request.query,
                 retrieval_result=retrieval_result,
+                enable_bbox=request.enable_bbox,
             )
             try:
                 cache_set_json(ans_cache_key, response)
@@ -1706,6 +1712,7 @@ def build_authenticated_query_request(
         version_ids=request.version_ids,
         recursive_search=request.recursive_search,
         top_k=request.top_k,
+        enable_bbox=request.enable_bbox,
     )
 
 

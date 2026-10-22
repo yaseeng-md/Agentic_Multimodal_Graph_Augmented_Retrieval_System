@@ -42,6 +42,7 @@ from transformers import (
 
 # Existing retrieval implementation.
 from query import retrieve, release_query_encoder
+from utils.visual_grounding import get_or_create_highlighted_page, extract_bounding_box
 
 
 load_dotenv()
@@ -196,6 +197,25 @@ GENERATOR_TOP_P = float(
     os.getenv("GENERATOR_TOP_P", "0.9")
 )
 
+# ---------------------------------------------------------------------------
+# Visual grounding / Bounding box configuration.
+# ---------------------------------------------------------------------------
+
+GENERATOR_ENABLE_BBOX = _env_bool(
+    "GENERATOR_ENABLE_BBOX",
+    False,
+)
+
+GENERATOR_BBOX_HIGHLIGHT = _env_bool(
+    "GENERATOR_BBOX_HIGHLIGHT",
+    True,
+)
+
+GENERATOR_BBOX_PROMPT = _env_bool(
+    "GENERATOR_BBOX_PROMPT",
+    True,
+)
+
 
 # ===========================================================================
 # Result structures
@@ -213,6 +233,9 @@ class GenerationSource:
     page_number: Optional[int]
     page_hash: Optional[str]
     page_image_path: Optional[str]
+    bounding_box: Optional[dict[str, Any]] = None
+    highlighted_image_path: Optional[str] = None
+    visualization_path: Optional[str] = None
 
 
 @dataclass
@@ -335,11 +358,14 @@ def _normalise_retrieval_page(
             else ""
         ),
         "is_current": get("is_current"),
+        "bounding_box": result.get("bounding_box"),
+        "highlighted_image_path": result.get("highlighted_image_path"),
     }
 
 
 def _build_generation_pages(
     retrieval_result: dict[str, Any],
+    enable_bbox: bool = False,
 ) -> list[dict[str, Any]]:
     raw_results = retrieval_result.get("results", [])
 
@@ -393,6 +419,19 @@ def _build_generation_pages(
 
         if usable_image:
             images_used += 1
+            if enable_bbox and GENERATOR_BBOX_HIGHLIGHT and page.get("bounding_box"):
+                bbox_info = page["bounding_box"]
+                bbox_norm = bbox_info.get("bbox_norm")
+                if bbox_norm and bbox_info.get("is_focal", True):
+                    try:
+                        highlighted_path = get_or_create_highlighted_page(
+                            page_image_path=image_path,
+                            bbox_norm=bbox_norm,
+                        )
+                        page["highlighted_image_path"] = highlighted_path
+                    except Exception as exc:
+                        logger.warning("Failed to create visual highlight: %s", exc)
+                        page["highlighted_image_path"] = None
         else:
             image_path = None
 
@@ -411,6 +450,7 @@ def _build_generation_pages(
 def _build_messages(
     query: str,
     pages: Sequence[dict[str, Any]],
+    enable_bbox: bool = False,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [
         {
@@ -468,12 +508,32 @@ def _build_messages(
                 }
             )
 
-        if page["page_image_path"]:
+        if enable_bbox and GENERATOR_BBOX_PROMPT and page.get("bounding_box"):
+            bbox_info = page["bounding_box"]
+            if bbox_info.get("is_focal", True):
+                bbox_norm = bbox_info.get("bbox_norm")
+                bbox_1000 = bbox_info.get("bbox_1000")
+                if bbox_norm and bbox_norm != [0.0, 0.0, 1.0, 1.0]:
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Visual Focus Region (Bounding Box):\n"
+                                f"- Normalized coordinates [ymin, xmin, ymax, xmax]: {bbox_norm}\n"
+                                f"- 1000-scale box: {bbox_1000}\n"
+                                "The page image below has a visual highlight box around this focal region. "
+                                "Focus on this specific area while referencing the full page for necessary context.\n"
+                            ),
+                        }
+                    )
+
+        image_to_feed = page.get("highlighted_image_path") or page.get("page_image_path")
+        if image_to_feed:
             content.append(
                 {
                     "type": "image",
                     "image": _local_file_uri(
-                        page["page_image_path"]
+                        image_to_feed
                     ),
                 }
             )
@@ -512,6 +572,13 @@ def _build_sources(
                 page_number=page["page_number"],
                 page_hash=page["page_hash"],
                 page_image_path=page["page_image_path"],
+                bounding_box=page.get("bounding_box"),
+                highlighted_image_path=page.get("highlighted_image_path"),
+                visualization_path=(
+                    page["bounding_box"].get("visualization_path")
+                    if isinstance(page.get("bounding_box"), dict)
+                    else None
+                ),
             )
         )
         for index, page in enumerate(pages, start=1)
@@ -643,6 +710,7 @@ class QwenGenerator:
         self,
         query: str,
         retrieval_result: dict[str, Any],
+        enable_bbox: bool = False,
     ) -> GenerationResponse:
         if not query or not query.strip():
             raise ValueError(
@@ -650,7 +718,8 @@ class QwenGenerator:
             )
 
         pages = _build_generation_pages(
-            retrieval_result
+            retrieval_result,
+            enable_bbox=enable_bbox,
         )
 
         if not pages:
@@ -662,6 +731,7 @@ class QwenGenerator:
         messages = _build_messages(
             query=query,
             pages=pages,
+            enable_bbox=enable_bbox,
         )
 
         started = time.perf_counter()
@@ -797,6 +867,16 @@ class QwenGenerator:
                     for page in pages
                     if page["page_image_path"]
                 ),
+                "visual_grounding": {
+                    "enabled": bool(enable_bbox),
+                    "highlight_overlay": bool(enable_bbox and GENERATOR_BBOX_HIGHLIGHT),
+                    "prompt_coordinates": bool(enable_bbox and GENERATOR_BBOX_PROMPT),
+                    "focal_sources": sum(
+                        1
+                        for page in pages
+                        if page.get("bounding_box") and page["bounding_box"].get("is_focal")
+                    ) if enable_bbox else 0,
+                },
                 "min_pixels": GENERATOR_MIN_PIXELS,
                 "max_pixels": GENERATOR_MAX_PIXELS,
                 "max_new_tokens": GENERATOR_MAX_NEW_TOKENS,
@@ -845,16 +925,21 @@ def query_and_generate(
     version_ids: Optional[Sequence[str]] = None,
     recursive_search: bool = False,
     top_k: int = 5,
+    enable_bbox: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
     Existing retrieve() -> optional ColPali release -> Qwen generation.
     """
+    if enable_bbox is None:
+        enable_bbox = GENERATOR_ENABLE_BBOX
+
     retrieval_result = retrieve(
         query=query,
         document_ids=document_ids,
         version_ids=version_ids,
         recursive_search=recursive_search,
         top_k=top_k,
+        include_bbox=enable_bbox,
     )
 
     logger.info(
@@ -876,6 +961,7 @@ def query_and_generate(
     generation_result = generator.generate_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        enable_bbox=enable_bbox,
     )
 
     return {
@@ -888,6 +974,7 @@ def query_and_generate(
 def generate_answer(
     query: str,
     retrieval_result: dict[str, Any],
+    enable_bbox: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
     Generate from an already completed retrieve() call.
@@ -895,6 +982,9 @@ def generate_answer(
     This function also honors GENERATOR_RELEASE_RETRIEVER for callers that
     retrieved data before entering this module.
     """
+    if enable_bbox is None:
+        enable_bbox = GENERATOR_ENABLE_BBOX
+
     if GENERATOR_RELEASE_RETRIEVER:
         release_query_encoder()
         _cleanup_cuda_memory()
@@ -904,6 +994,7 @@ def generate_answer(
     result = generator.generate_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        enable_bbox=enable_bbox,
     )
 
     return asdict(result)
@@ -977,6 +1068,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--enable-bbox",
+        action="store_true",
+        help="Extract focal bounding boxes and highlight relevant regions for generation.",
+    )
+
+    parser.add_argument(
         "--output",
         default="generation_result.json",
         help="Optional JSON output file.",
@@ -1002,6 +1099,7 @@ def main() -> None:
         version_ids=args.version_ids,
         recursive_search=args.recursive_search,
         top_k=args.top_k,
+        enable_bbox=args.enable_bbox,
     )
 
     print(

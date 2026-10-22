@@ -68,6 +68,8 @@ except ImportError as exc:  # pragma: no cover - environment dependent
         "Install the same ColPali dependency used by the ingestion pipeline."
     ) from exc
 
+from utils.visual_grounding import extract_bounding_box
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -429,7 +431,11 @@ def _check_collection(client: QdrantClient) -> None:
         )
 
 
-def _serialise_point(point: Any, rank: int) -> dict[str, Any]:
+def _serialise_point(
+    point: Any,
+    rank: int,
+    bounding_box: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Convert a Qdrant ScoredPoint to JSON-friendly retrieval output."""
     point_id = point.id
     payload = dict(point.payload or {})
@@ -447,6 +453,7 @@ def _serialise_point(point: Any, rank: int) -> dict[str, Any]:
         "page_image_path": payload.get("page_image_path"),
         "page_text": payload.get("page_text"),
         "is_current": payload.get("is_current"),
+        "bounding_box": bounding_box,
         "payload": payload,
     }
 
@@ -460,6 +467,7 @@ def retrieve(
     version_ids: Optional[Sequence[str]] = None,
     recursive_search: bool = False,
     top_k: int = 5,
+    include_bbox: bool = False,
 ) -> dict[str, Any]:
     """
     Retrieve the top-k relevant PDF pages for a text query.
@@ -478,6 +486,8 @@ def retrieve(
         every document.
     top_k:
         Number of ranked pages to return.
+    include_bbox:
+        If True, derive focal patch-level bounding boxes for each retrieved page.
 
     Returns
     -------
@@ -499,6 +509,8 @@ def retrieve(
     print(f"[Retrieval] Query: {query}")
     print(f"[Retrieval] Scope: {scope.mode}")
     print(f"[Retrieval] Top-K: {top_k}")
+    if include_bbox:
+        print("[Retrieval] BBox Extraction: Enabled")
 
     encoder = get_query_encoder()
     query_embedding = encoder.encode(query)
@@ -515,17 +527,55 @@ def retrieve(
         query_filter=query_filter,
         limit=top_k,
         with_payload=True,
-        with_vectors=False,
+        with_vectors=True if include_bbox else False,
     )
 
-    results = [
-        _serialise_point(point, rank=index)
-        for index, point in enumerate(response.points, start=1)
-    ]
+    query_tokens = None
+    if include_bbox:
+        try:
+            batch = encoder.processor.process_queries([query])
+            if hasattr(batch, "input_ids") and len(batch.input_ids) > 0:
+                query_tokens = [
+                    encoder.processor.tokenizer.decode([t])
+                    for t in batch.input_ids[0].tolist()
+                ]
+        except Exception as exc:
+            print(f"[Retrieval] Warning: Failed to extract query tokens for bbox: {exc}")
+            query_tokens = None
+
+    results = []
+    for index, point in enumerate(response.points, start=1):
+        bbox_data = None
+        if include_bbox:
+            p_vec = None
+            if isinstance(point.vector, dict):
+                p_vec = point.vector.get(QDRANT_VECTOR_NAME)
+            elif point.vector is not None:
+                p_vec = point.vector
+
+            if p_vec is not None:
+                try:
+                    payload = dict(point.payload or {})
+                    page_img = payload.get("page_image_path")
+                    bbox_data = extract_bounding_box(
+                        query_embeddings=query_embedding,
+                        page_embeddings=p_vec,
+                        query_tokens=query_tokens,
+                        page_image=page_img,
+                        query_text=query,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[Retrieval] Warning: BBox extraction failed for point {point.id}: {exc}"
+                    )
+                    bbox_data = None
+
+        results.append(_serialise_point(point, rank=index, bounding_box=bbox_data))
 
     return {
         "query": query,
         "top_k": top_k,
+        "include_bbox": include_bbox,
         "scope": {
             "mode": scope.mode,
             "document_ids": list(scope.document_ids),
@@ -575,6 +625,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of results to return (default: 5).",
     )
+    parser.add_argument(
+        "--enable-bbox",
+        action="store_true",
+        help="Compute patch-level focal bounding boxes for retrieved pages.",
+    )
 
     return parser
 
@@ -589,6 +644,7 @@ def main() -> None:
         version_ids=args.version_ids,
         recursive_search=args.recursive_search,
         top_k=args.top_k,
+        include_bbox=args.enable_bbox,
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
