@@ -600,8 +600,41 @@ def ingest_one_document(
         if current_version is not None and current_version["version_id"] != version_id:
             qdrant.demote_previous_versions(
                 document_id=document_id,
-                current_version_id=current_version["version_id"],
+                current_version_id=version_id,
             )
+
+        # Path B: Structured document parsing and knowledge graph construction
+        graph_report_dict = None
+        try:
+            from graph.config import DOCLING_ENABLED, NEO4J_ENABLED
+            if DOCLING_ENABLED or NEO4J_ENABLED:
+                from graph.pipeline import GraphIngestionPipeline
+                graph_pipe = GraphIngestionPipeline()
+                g_report = graph_pipe.ingest_document_graph(
+                    pdf_path=pdf_path,
+                    document_id=document_id,
+                    version_id=version_id,
+                    version_number=version_number,
+                    file_hash=file_hash,
+                    original_filename=original_filename,
+                    stored_pdf_path=str(stored_pdf_path),
+                    rendered_pages=pages,
+                    is_current=True,
+                )
+                if current_version is not None and current_version["version_id"] != version_id:
+                    graph_pipe.neo4j_store.demote_previous_versions(
+                        document_id=document_id,
+                        current_version_id=version_id,
+                    )
+                graph_report_dict = g_report.model_dump()
+        except Exception as g_exc:
+            logger.warning("Path B graph ingestion encountered an error: %s", g_exc)
+            graph_report_dict = {
+                "document_id": document_id,
+                "version_id": version_id,
+                "status": "failed",
+                "error": str(g_exc),
+            }
 
         registry.update_version(
             version_id,
@@ -623,6 +656,7 @@ def ingest_one_document(
             "reused_embeddings": total_reused_embeddings,
             "stored_pdf": stored_pdf_path,
             "page_image_dir": str(output_dir),
+            "graph": graph_report_dict,
         }
 
     except Exception:
@@ -786,12 +820,90 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--sync-graph",
+        action="store_true",
+        help="Build or sync Neo4j knowledge graph for all existing documents in registry without re-embedding.",
+    )
+
+    parser.add_argument(
         "--reset-registry",
         action="store_true",
         help="Delete the local ingestion registry database. Does not delete Qdrant data.",
     )
 
     return parser.parse_args()
+
+
+def sync_graph_for_registry(registry_path: Path = REGISTRY_DB_PATH) -> list[dict]:
+    """Sync Neo4j knowledge graph for all documents in SQLite registry without re-embedding."""
+    from graph.config import DOCLING_ENABLED, NEO4J_ENABLED
+    if not DOCLING_ENABLED or not NEO4J_ENABLED:
+        logger.warning("Graph sync skipped: DOCLING_ENABLED=%s, NEO4J_ENABLED=%s", DOCLING_ENABLED, NEO4J_ENABLED)
+        return []
+
+    from graph.pipeline import GraphIngestionPipeline
+    registry = Registry(registry_path)
+    pipeline = GraphIngestionPipeline()
+    reports: list[dict] = []
+
+    try:
+        doc_rows = registry.conn.execute(
+            """
+            SELECT
+                v.original_filename,
+                v.document_id,
+                v.version_id,
+                v.version_number,
+                v.file_hash,
+                v.stored_pdf_path,
+                CASE WHEN d.current_version_id = v.version_id THEN 1 ELSE 0 END AS is_current
+            FROM versions v
+            JOIN documents d ON d.document_id = v.document_id
+            WHERE d.current_version_id = v.version_id
+            ORDER BY v.document_id, v.version_number
+            """
+        ).fetchall()
+        logger.info("Found %d current document versions to sync with Neo4j.", len(doc_rows))
+
+        for row in doc_rows:
+            doc_id = row["document_id"]
+            ver_id = row["version_id"]
+            pdf_path = Path(row["stored_pdf_path"])
+            if not pdf_path.exists():
+                logger.warning("Stored PDF not found: %s", pdf_path)
+                continue
+
+            page_rows = registry.get_pages(ver_id)
+            pages_list = []
+            output_dir = PAGE_IMAGE_DIR / doc_id / ver_id
+            for page_hash, p_row in page_rows.items():
+                p_num = p_row["page_number"]
+                img_path = output_dir / f"page_{p_num:04d}.png"
+                pages_list.append({
+                    "page_number": p_num,
+                    "page_hash": page_hash,
+                    "point_id": p_row["point_id"],
+                    "image_path": str(img_path) if img_path.exists() else "",
+                })
+
+            pages_list.sort(key=lambda x: x["page_number"])
+            report = pipeline.ingest_document_graph(
+                pdf_path=pdf_path,
+                document_id=doc_id,
+                version_id=ver_id,
+                version_number=row["version_number"],
+                file_hash=row["file_hash"],
+                original_filename=row["original_filename"],
+                stored_pdf_path=str(pdf_path),
+                rendered_pages=pages_list,
+                is_current=True,
+            )
+            reports.append(report.model_dump())
+
+    finally:
+        registry.close()
+
+    return reports
 
 
 def main() -> None:
@@ -804,6 +916,13 @@ def main() -> None:
         registry.reset()
         registry.close()
         logger.warning("Reset ingestion registry: %s", REGISTRY_DB_PATH)
+
+    if args.sync_graph:
+        results = sync_graph_for_registry()
+        print("\nGraph sync summary:")
+        for r in results:
+            print(json.dumps(r, indent=2))
+        return
 
     if args.dummy_test:
         results = dummy_ingestion_test()

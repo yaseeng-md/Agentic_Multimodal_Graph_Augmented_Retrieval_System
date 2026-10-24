@@ -362,6 +362,8 @@ def _normalise_retrieval_page(
             else ""
         ),
         "is_current": get("is_current"),
+        "retrieval_sources": result.get("retrieval_sources") or payload.get("retrieval_sources") or ["visual"],
+        "graph_claims": result.get("graph_claims") or payload.get("graph_claims") or [],
     }
 
 
@@ -483,6 +485,25 @@ def _build_messages(
                 ),
             }
         )
+
+        if page.get("graph_claims"):
+            claims = page["graph_claims"]
+            claims_lines = []
+            for c in claims[:5]:
+                sub = c.get("subject", "")
+                pred = c.get("predicate", "")
+                obj = c.get("object_or_value", "")
+                ev = c.get("evidence_text", "")
+                claims_lines.append(f"- {sub} {pred} {obj} (Evidence excerpt: \"{ev}\")")
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "Verified Structured Knowledge Graph Claims:\n"
+                        + "\n".join(claims_lines)
+                    ),
+                }
+            )
 
         if page["page_text"]:
             content.append(
@@ -875,18 +896,18 @@ def query_and_generate(
     enable_rerank: Optional[bool] = None,
     rerank_threshold: Optional[float] = None,
     retrieval_top_k: Optional[int] = None,
+    enable_graph: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
     Multimodal generation pipeline:
-    1. Retrieval with ColPali (retrieving top-20 if reranking is enabled).
-    2. Optional Jina multimodal reranking (jina-reranker-m0) filtering by relevance score >= 0.75,
-       selecting the top 5 candidates for generation.
-    3. GPU memory cleanup (release ColPali encoder).
-    4. Qwen3-VL-2B-Instruct multimodal grounded generation.
+    1. Retrieval combining ColPali visual vectors and Neo4j knowledge graph.
+    2. Candidate page deduplication with provenance retention.
+    3. Optional Jina multimodal reranking (jina-reranker-m0) on merged page candidates.
+    4. GPU memory cleanup (release ColPali encoder).
+    5. Qwen3-VL-2B-Instruct multimodal grounded generation with graph context.
     """
     should_rerank = GENERATOR_ENABLE_RERANK if enable_rerank is None else enable_rerank
     cutoff_threshold = GENERATOR_RERANK_THRESHOLD if rerank_threshold is None else rerank_threshold
-
     fetch_top_k = (retrieval_top_k or GENERATOR_RERANK_RETRIEVAL_TOP_K) if should_rerank else top_k
 
     retrieval_result = retrieve(
@@ -895,28 +916,13 @@ def query_and_generate(
         version_ids=version_ids,
         recursive_search=recursive_search,
         top_k=fetch_top_k,
+        enable_rerank=should_rerank,
+        rerank_threshold=cutoff_threshold,
+        retrieval_top_k=fetch_top_k,
+        enable_graph=enable_graph,
     )
 
-    rerank_metadata: dict[str, Any] = {}
-    if should_rerank:
-        reranker = JinaReranker()
-        reranked_pages, rerank_ms = reranker.rerank_retrieval_results(
-            query=query,
-            retrieval_candidates=retrieval_result.get("results", []),
-            threshold=cutoff_threshold,
-            top_k=min(top_k, GENERATOR_RERANK_TOP_K),
-        )
-        rerank_metadata = {
-            "reranked": True,
-            "model": reranker.model,
-            "initial_candidates_count": len(retrieval_result.get("results", [])),
-            "final_candidates_count": len(reranked_pages),
-            "threshold": cutoff_threshold,
-            "latency_ms": round(rerank_ms, 2),
-        }
-        retrieval_result["results"] = reranked_pages
-        retrieval_result["result_count"] = len(reranked_pages)
-        retrieval_result["rerank"] = rerank_metadata
+    rerank_metadata = retrieval_result.get("rerank", {})
 
     logger.info(
         "Retrieval completed (rerank=%s). GPU memory: %s",

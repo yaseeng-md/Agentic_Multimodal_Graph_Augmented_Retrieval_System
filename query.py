@@ -454,8 +454,65 @@ def _serialise_point(point: Any, rank: int) -> dict[str, Any]:
         "page_image_path": payload.get("page_image_path"),
         "page_text": payload.get("page_text"),
         "is_current": payload.get("is_current"),
+        "retrieval_sources": ["visual"],
+        "graph_claims": [],
         "payload": payload,
     }
+
+
+def _merge_retrieval_candidates(
+    visual_candidates: list[dict[str, Any]],
+    graph_candidates: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """
+    Merge visual and graph-derived page candidates by stable page identity.
+    Preserves retrieval provenance and avoids duplicate pages.
+    """
+    merged_map: dict[tuple[str, str, int], dict[str, Any]] = {}
+    ordered_keys: list[tuple[str, str, int]] = []
+
+    # 1. Index visual candidates
+    for c in visual_candidates:
+        doc_id = str(c.get("document_id") or "")
+        ver_id = str(c.get("version_id") or "")
+        p_num = int(c.get("page_number") or 1)
+        key = (doc_id, ver_id, p_num)
+
+        rec = dict(c)
+        rec["retrieval_sources"] = ["visual"]
+        rec["graph_claims"] = []
+        merged_map[key] = rec
+        ordered_keys.append(key)
+
+    # 2. Merge graph candidates
+    for g in graph_candidates:
+        doc_id = str(g.get("document_id") or "")
+        ver_id = str(g.get("version_id") or "")
+        p_num = int(g.get("page_number") or 1)
+        key = (doc_id, ver_id, p_num)
+
+        if key in merged_map:
+            # Candidate discovered by BOTH visual and graph retrievers
+            target = merged_map[key]
+            if "graph" not in target["retrieval_sources"]:
+                target["retrieval_sources"].append("graph")
+            target["graph_claims"] = g.get("graph_claims") or []
+            if not target.get("page_text") and g.get("page_text"):
+                target["page_text"] = g["page_text"]
+        else:
+            # Novel relevant page candidate discovered exclusively via graph relationships
+            rec = dict(g)
+            rec["retrieval_sources"] = ["graph"]
+            merged_map[key] = rec
+            ordered_keys.append(key)
+
+    merged_list = [merged_map[k] for k in ordered_keys]
+
+    for i, item in enumerate(merged_list, start=1):
+        item["rank"] = i
+
+    return merged_list[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -470,36 +527,11 @@ def retrieve(
     enable_rerank: bool = False,
     rerank_threshold: float = DEFAULT_RERANK_RELEVANCE_THRESHOLD,
     retrieval_top_k: int = DEFAULT_RERANK_RETRIEVAL_TOP_K,
+    enable_graph: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
-    Retrieve the top-k relevant PDF pages for a text query, with optional Jina multimodal reranking.
-
-    Parameters
-    ----------
-    query:
-        Natural-language user query.
-    document_ids:
-        Optional logical document IDs to restrict retrieval to.
-    version_ids:
-        Optional exact version IDs to restrict retrieval to. These take
-        precedence over document_ids unless recursive_search=True.
-    recursive_search:
-        If True, ignore document_ids/version_ids and search every version of
-        every document.
-    top_k:
-        Number of ranked pages to return (post-rerank if enabled).
-    enable_rerank:
-        If True, retrieves initial candidates (default: 20) with ColPali and reranks
-        them with jina-reranker-m0, applying the relevance score threshold.
-    rerank_threshold:
-        Relevance score threshold for reranked candidates (default: 0.75).
-    retrieval_top_k:
-        Number of candidates to retrieve initially before reranking (default: 20).
-
-    Returns
-    -------
-    dict
-        JSON-serialisable retrieval response.
+    Retrieve the top-k relevant PDF pages for a text query, combining visual (ColPali)
+    and knowledge graph (Neo4j) retrieval with optional Jina multimodal reranking.
     """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string")
@@ -515,10 +547,18 @@ def retrieve(
 
     fetch_limit = max(top_k, retrieval_top_k) if enable_rerank else top_k
 
+    # Resolve graph retrieval flag
+    try:
+        from graph.config import GRAPH_RETRIEVAL_ENABLED
+        graph_active = GRAPH_RETRIEVAL_ENABLED if enable_graph is None else bool(enable_graph)
+    except Exception:
+        graph_active = False if enable_graph is None else bool(enable_graph)
+
     print(f"[Retrieval] Query: {query}")
     print(f"[Retrieval] Scope: {scope.mode}")
-    print(f"[Retrieval] Top-K: {top_k} (Fetch limit: {fetch_limit}, Rerank: {enable_rerank})")
+    print(f"[Retrieval] Top-K: {top_k} (Fetch limit: {fetch_limit}, Rerank: {enable_rerank}, Graph: {graph_active})")
 
+    # 1. Path A: ColPali visual retrieval from Qdrant
     encoder = get_query_encoder()
     query_embedding = encoder.encode(query)
 
@@ -537,17 +577,65 @@ def retrieve(
         with_vectors=False,
     )
 
-    results = [
+    visual_candidates = [
         _serialise_point(point, rank=index)
         for index, point in enumerate(response.points, start=1)
     ]
 
+    # 2. Path B: Knowledge graph retrieval from Neo4j
+    graph_metadata: dict[str, Any] = {"enabled": graph_active}
+    graph_pages: list[dict[str, Any]] = []
+
+    if graph_active:
+        try:
+            from graph.retriever import GraphRetriever
+            g_retriever = GraphRetriever()
+            doc_filter = list(scope.document_ids) if scope.mode == "documents_current_versions" else None
+            ver_filter = list(scope.version_ids) if scope.mode == "explicit_versions" else None
+
+            g_res = g_retriever.retrieve(
+                query=query,
+                document_ids=doc_filter,
+                version_ids=ver_filter,
+                recursive_search=scope.recursive_search,
+                page_limit=fetch_limit,
+            )
+            graph_pages = g_res.source_pages
+            graph_metadata.update({
+                "status": g_res.status,
+                "matched_entities": g_res.matched_entities,
+                "claims_count": len(g_res.claims),
+                "claims": [c.model_dump() for c in g_res.claims[:10]],
+                "pages_found": len(g_res.source_pages),
+                "latency_ms": g_res.duration_ms,
+            })
+            if g_res.error:
+                graph_metadata["error"] = g_res.error
+        except Exception as g_exc:
+            logger.warning("Graph retrieval failed gracefully: %s", g_exc)
+            graph_metadata.update({
+                "status": "service_unavailable",
+                "error": str(g_exc),
+            })
+
+    # 3. Merge candidates (Union with deduplication & provenance retention)
+    if graph_pages:
+        merged_candidates = _merge_retrieval_candidates(
+            visual_candidates=visual_candidates,
+            graph_candidates=graph_pages,
+            limit=fetch_limit,
+        )
+    else:
+        merged_candidates = visual_candidates
+
+    # 4. Multimodal Reranking via Jina (if enabled)
+    results = merged_candidates
     rerank_metadata: dict[str, Any] = {}
     if enable_rerank:
         reranker = JinaReranker()
         reranked_results, rerank_latency = reranker.rerank_retrieval_results(
             query=query,
-            retrieval_candidates=results,
+            retrieval_candidates=merged_candidates,
             threshold=rerank_threshold,
             top_k=top_k,
         )
@@ -555,10 +643,12 @@ def retrieve(
             "reranked": True,
             "rerank_model": reranker.model,
             "rerank_threshold": rerank_threshold,
-            "retrieval_candidates_count": len(results),
+            "retrieval_candidates_count": len(merged_candidates),
             "rerank_latency_ms": round(rerank_latency, 2),
         }
         results = reranked_results
+    else:
+        results = results[:top_k]
 
     response_payload: dict[str, Any] = {
         "query": query,
@@ -571,6 +661,7 @@ def retrieve(
         },
         "result_count": len(results),
         "results": results,
+        "graph": graph_metadata,
     }
     if rerank_metadata:
         response_payload["rerank"] = rerank_metadata
@@ -633,6 +724,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RERANK_RETRIEVAL_TOP_K,
         help=f"Number of candidates to retrieve initially before reranking (default: {DEFAULT_RERANK_RETRIEVAL_TOP_K}).",
     )
+    parser.add_argument(
+        "--enable-graph",
+        action="store_true",
+        default=None,
+        help="Explicitly enable knowledge graph retrieval.",
+    )
+    parser.add_argument(
+        "--disable-graph",
+        action="store_true",
+        help="Explicitly disable knowledge graph retrieval.",
+    )
 
     return parser
 
@@ -640,6 +742,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
+
+    graph_flag = None
+    if args.disable_graph:
+        graph_flag = False
+    elif args.enable_graph:
+        graph_flag = True
 
     result = retrieve(
         query=args.query,
@@ -650,6 +758,7 @@ def main() -> None:
         enable_rerank=args.enable_rerank,
         rerank_threshold=args.rerank_threshold,
         retrieval_top_k=args.retrieval_top_k,
+        enable_graph=graph_flag,
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))

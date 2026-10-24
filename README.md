@@ -110,17 +110,21 @@ flowchart TD
         IngestEngine["Ingestion Engine (ingest.py)"]
         QueryEngine["Retrieval Engine (query.py)"]
         GenEngine["Generation Engine (generate.py)"]
+        GraphEngine["Graph Pipeline (graph/pipeline.py)"]
+        DoclingProc["Docling Parser (graph/docling_processor.py)"]
     end
 
-    subgraph ModelsLayer["Quantized Inference (BitsAndBytes 4-bit NF4)"]
-        ColPali["ColPali v1.3 Multivector Embedder"]
-        QwenVL["Qwen3-VL-2B-Instruct Generator"]
+    subgraph ModelsLayer["Inference & Extraction"]
+        ColPali["ColPali v1.3 Multivector Embedder (NF4)"]
+        QwenVL["Qwen3-VL-2B-Instruct Generator (NF4)"]
+        GraphExtractor["Schema-Validated Extractor (OpenRouter LLM)"]
     end
 
     subgraph StorageLayer["Persistence Layer"]
         RegistryDB[("SQLite Registry (ingestion_registry.db)")]
-        LocalStore["Local Disk (data/pdfs, data/pages)"]
+        LocalStore["Local Disk (data/pdfs, data/pages, data/docling_cache)"]
         QdrantDB[("Qdrant Vector DB (:6333) MAX_SIM")]
+        Neo4jDB[("Neo4j Knowledge Graph (:7687)")]
     end
 
     Client -->|HTTP Requests + Bearer Token| AuthMiddleware
@@ -138,9 +142,15 @@ flowchart TD
     IngestEngine --> RegistryDB
     IngestEngine --> LocalStore
     IngestEngine --> QdrantDB
+    IngestEngine --> GraphEngine
+
+    GraphEngine --> DoclingProc
+    GraphEngine --> GraphExtractor
+    GraphEngine --> Neo4jDB
 
     QueryEngine --> ColPali
     QueryEngine --> QdrantDB
+    QueryEngine --> Neo4jDB
 
     GenEngine --> QueryEngine
     GenEngine --> QwenVL
@@ -192,6 +202,84 @@ sequenceDiagram
     API->>Redis: Cache answer & update idempotency
     API-->>Client: 200 OK (answer, sources, latency metrics)
 ```
+
+---
+
+## Docling & Neo4j Knowledge Graph Integration
+
+AMG features a dual-ingestion and dual-retrieval architecture combining late-interaction multimodal vector search (ColPali + Qdrant) with structural document parsing (Docling) and a knowledge graph (Neo4j).
+
+### Responsibilities of System Components
+
+| Component | Role in AMG | Key Technologies & APIs |
+|---|---|---|
+| **ColPali** | Multimodal page embedding | `vidore/colpali-v1.3-merged` (4-bit NF4), MaxSim token patches |
+| **Qdrant** | Multi-vector page index & payload store | `personal_collection`, multivector MAX_SIM, Cosine distance |
+| **Docling** | Document layout & structural parser | `docling.document_converter.DocumentConverter`, tables & headings |
+| **Neo4j** | Knowledge graph & claim provenance | Official `neo4j` Bolt driver (`bolt://localhost:7687`), Cypher MERGE |
+| **Jina Reranker** | Cross-modal candidate reranking | `jina-reranker-m0` REST API (`api.jina.ai/v1/rerank`) |
+| **Qwen3-VL** | Grounded multimodal answer generator | `Qwen/Qwen3-VL-2B-Instruct` (4-bit NF4) |
+
+### Ingestion Flow: Dual Paths (Path A & Path B)
+
+Every eligible PDF document undergoes two complementary ingestion paths:
+
+1. **Path A: Visual Retrieval Path**:
+   - Computes SHA-256 PDF file hash for duplicate prevention.
+   - Rasterizes PDF pages at 150 DPI via PyMuPDF (`fitz`) to PNG (`data/pages/<doc_id>/<version_id>/page_0001.png`).
+   - Generates ColPali late-interaction multi-vectors with BitsAndBytes 4-bit NF4.
+   - Upserts vectors and page metadata into Qdrant (`personal_collection`).
+
+2. **Path B: Structured Document & Graph Construction Path**:
+   - Parses document structure with Docling, extracting headings, text blocks, and markdown tables.
+   - Preserves 1-based source page numbering matching PyMuPDF rasterization.
+   - Caches parsed document structures (`data/docling_cache/<file_hash>.json`) for fast repeat ingestion.
+   - Extracts factual entities and provenance-backed claims via schema-enforced OpenRouter LLM.
+   - Upserts nodes and relationships into Neo4j using parameterized, idempotent Cypher queries.
+
+### Knowledge Graph Schema & Provenance Model
+
+- **Nodes**:
+  - `Document`: Logical document identity (`document_id`, `display_name`).
+  - `Version`: Content version (`version_id`, `version_number`, `file_hash`, `stored_pdf_path`, `is_current`).
+  - `Page`: Document page (`page_id`, `page_number`, `point_id`, `image_path`, `page_hash`, `is_current`).
+  - `Chunk`: Structural chunk (`chunk_id`, `chunk_type`, `text`, `heading_path`).
+  - `Entity`: Factual entity (`entity_id`, `name`, `normalized_name`, `entity_type`).
+  - `Claim`: Factual relationship assertion (`claim_id`, `predicate`, `target_value`, `confidence`, `evidence_text`).
+
+- **Relationships**:
+  - `(Document)-[:HAS_VERSION]->(Version)-[:HAS_PAGE]->(Page)-[:HAS_CHUNK]->(Chunk)`
+  - `(Chunk)-[:MENTIONS]->(Entity)`
+  - `(Entity)-[:SUBJECT_OF]->(Claim)`
+  - `(Claim)-[:OBJECT_OF]->(Entity)` (or property `target_value` for literal/numeric metrics)
+  - `(Claim)-[:SOURCED_FROM]->(Chunk)`
+  - `(Claim)-[:ON_PAGE]->(Page)`
+
+### Dual Retrieval & Evidence Merging Flow
+
+When a user submits a query:
+1. **Visual Retrieval**: ColPali encodes the text query into token multivectors and retrieves top page candidates from Qdrant via MaxSim.
+2. **Graph Retrieval**: Identifies candidate entity terms in the query and traverses 1-hop and 2-hop relationships in Neo4j to find verified claims and their source pages.
+3. **Candidate Merging & Deduplication**:
+   - Candidates are merged by stable page identity `(document_id, version_id, page_number)`.
+   - Distinct pages discovered exclusively by the graph are added to the candidate pool (not substituted).
+   - Overlapping pages retain dual discovery provenance (`retrieval_sources: ["visual", "graph"]`) and attach verified graph claims.
+4. **Multimodal Reranking**: The merged page candidates are reranked using `jina-reranker-m0` on their page images, scoring candidates on a uniform scale.
+5. **Grounded Generation**: Qwen3-VL receives selected reranked page images, extracted text, and verified structured knowledge graph claims in its grounded prompt.
+
+### How to Disable Graph Functionality
+
+If Neo4j is offline or graph retrieval is not desired, set in `.env`:
+```env
+DOCLING_ENABLED=false
+NEO4J_ENABLED=false
+GRAPH_RETRIEVAL_ENABLED=false
+```
+Or via CLI:
+```bash
+python query.py --query "your query" --disable-graph
+```
+The system will run strictly on the visual ColPali + Qdrant baseline.
 
 ---
 

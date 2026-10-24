@@ -159,3 +159,5 @@ websockets==17.1
 wheel==0.47.0
 xxhash==3.8.0
 yarl==1.24.2
+docling==2.142.0
+neo4j==6.4.1

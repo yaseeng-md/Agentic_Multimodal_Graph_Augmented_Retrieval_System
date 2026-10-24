@@ -17,7 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -235,6 +235,7 @@ class QueryRequest(BaseModel):
     enable_rerank: bool = False
     rerank_threshold: float = 0.75
     retrieval_top_k: int = 20
+    enable_graph: bool | None = None
 
     @field_validator("user_id", "organization", "role", "query")
     @classmethod
@@ -1190,6 +1191,7 @@ def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
                 enable_rerank=getattr(request, "enable_rerank", False),
                 rerank_threshold=getattr(request, "rerank_threshold", 0.75),
                 retrieval_top_k=getattr(request, "retrieval_top_k", 20),
+                enable_graph=getattr(request, "enable_graph", None),
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:
@@ -1437,6 +1439,7 @@ def _run_generate_job(
                 enable_rerank=getattr(request, "enable_rerank", False),
                 rerank_threshold=getattr(request, "rerank_threshold", 0.75),
                 retrieval_top_k=getattr(request, "retrieval_top_k", 20),
+                enable_graph=getattr(request, "enable_graph", None),
             )
             # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
             try:
