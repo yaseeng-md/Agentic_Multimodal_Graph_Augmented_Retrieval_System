@@ -1,0 +1,134 @@
+# ============================================================================
+# AMG (Agentic Multimodal Graph-Augmented Retrieval System) - Docker Compose
+# ============================================================================
+# Services:
+#   1. qdrant - ColPali multi-vector late-interaction store
+#   2. redis  - Token revocation, rate limiting, and result caching
+#   3. neo4j  - Structured Docling knowledge graph and claim provenance
+#   4. api    - AMG FastAPI multimodal query, ingestion, and generation engine
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # 1. Qdrant Vector Database
+  # --------------------------------------------------------------------------
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    container_name: ${QDRANT_CONTAINER_NAME:-amg-qdrant}
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_HOST_PORT:-6334}:6334"
+    volumes:
+      - amg_qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - amg-network
+
+  # --------------------------------------------------------------------------
+  # 2. Redis In-Memory Cache & Lock Store
+  # --------------------------------------------------------------------------
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ${REDIS_CONTAINER_NAME:-amg-redis}
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - amg_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - amg-network
+
+  # --------------------------------------------------------------------------
+  # 3. Neo4j Knowledge Graph Store
+  # --------------------------------------------------------------------------
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    container_name: ${NEO4J_CONTAINER_NAME:-amg-neo4j}
+    restart: unless-stopped
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-amg_neo4j_password_2026}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - amg_neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USERNAME:-neo4j} -p ${NEO4J_PASSWORD:-amg_neo4j_password_2026} 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - amg-network
+
+  # --------------------------------------------------------------------------
+  # 4. AMG Core API Engine
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: amg-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Network endpoints for compose services
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-amg_neo4j_password_2026}
+      - RUNNING_IN_DOCKER=true
+      # Durable storage paths inside container
+      - DATA_DIR=/app/data
+      - REGISTRY_DB_PATH=/app/data/ingestion_registry.db
+      - PDF_DIR=/app/data/pdfs
+      - PAGE_IMAGE_DIR=/app/data/pages
+      - API_JOB_DB_PATH=/app/data/ingestion_jobs.db
+      - API_JOB_DATA_DIR=/app/data/api_jobs
+      - QUERY_JOB_DB_PATH=/app/data/query_jobs.db
+      - QUERY_LOG_DIR=/app/data/query
+      - GENERATE_JOB_DB_PATH=/app/data/generate_jobs.db
+      - GENERATE_LOG_DIR=/app/data/generate
+      - DOCLING_CACHE_DIR=/app/data/docling_cache
+    volumes:
+      - ./data:/app/data
+      - amg_huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - amg-network
+
+volumes:
+  amg_qdrant_storage:
+  amg_redis_data:
+  amg_neo4j_data:
+  amg_huggingface_cache:
+
+networks:
+  amg-network:
+    driver: bridge

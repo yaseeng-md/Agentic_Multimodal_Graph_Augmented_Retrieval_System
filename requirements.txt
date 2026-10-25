@@ -138,8 +138,8 @@ sympy==1.14.0
 tenacity==9.2.1
 threadpoolctl==3.6.0
 tokenizers==0.23.3
-torch==2.11.0+cu130
-torchvision==0.26.0+cu130
+torch>=2.4.0
+torchvision>=0.19.0
 tqdm==4.68.3
 traits==7.1.0
 transformers==5.20.1

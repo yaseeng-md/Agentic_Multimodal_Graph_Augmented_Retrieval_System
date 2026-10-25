@@ -1,0 +1,20 @@
+# ============================================================================
+# AMG (Agentic Multimodal Graph-Augmented Retrieval System) - GPU Extension
+# ============================================================================
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Requirements:
+#   - NVIDIA GPU
+#   - NVIDIA Container Toolkit (nvidia-container-toolkit) installed on the host
+# ============================================================================
+
+services:
+  api:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

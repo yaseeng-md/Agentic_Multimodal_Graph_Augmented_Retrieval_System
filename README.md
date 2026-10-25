@@ -387,11 +387,55 @@ python eval/run_generation.py --dataset openrag --config hotpotqa --sample 10
 ### Prerequisites
 
 - **OS**: Linux (tested on Ubuntu 22.04 / 24.04 LTS)
-- **Python**: 3.10+
+- **Python**: 3.10+ (for local bare-metal / virtualenv runs)
 - **Hardware**: NVIDIA GPU with $\ge 6\text{ GB}$ VRAM (CUDA 12.0+)
-- **Docker**: Docker Engine or Docker Desktop running
+- **Docker**: Docker Engine (v24+) with Docker Compose (v2.20+)
 
-### Step 1: Clone and Set Up Virtual Environment
+---
+
+### Option A: Run Fully Containerized with Docker Compose (Recommended)
+
+Run the entire AMG stack—FastAPI core engine, Qdrant vector database, Redis cache, and Neo4j graph database—with a single command:
+
+```bash
+# 1. Clone repository
+git clone <repo-link>
+cd amg
+
+# 2. Configure environment
+cp .env_sample .env
+# Edit .env with your OPENROUTER_API_KEY (for graph extraction) and JINA_RERANKER_KEY
+
+# 3. Start all services in the background
+docker compose up --build -d
+
+# Check status and health of all containers
+docker compose ps
+```
+
+#### With GPU Passthrough (NVIDIA Container Toolkit)
+If your host has the `nvidia-container-toolkit` installed, launch with the GPU overlay for accelerated ColPali embedding and Qwen-VL generation:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
+#### Monitoring & Teardown
+```bash
+# View API service logs
+docker compose logs -f api
+
+# Stop all containers
+docker compose down
+```
+
+Access the interactive OpenAPI Swagger UI at `http://localhost:8000/docs`.
+
+---
+
+### Option B: Local Virtual Environment Setup
+
+#### Step 1: Clone and Set Up Virtual Environment
 
 ```bash
 git clone <repo-link>
@@ -403,7 +447,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Step 2: Environment Configuration
+#### Step 2: Environment Configuration
 
 Create your `.env` file from the sample:
 
@@ -428,6 +472,11 @@ QDRANT_VECTOR_NAME=page_embedding
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6380
 
+# Neo4j Graph DB
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=amg_neo4j_password_2026
+
 # Security (Set a strong 32+ character key in production)
 JWT_SECRET_KEY=replace-with-a-very-strong-secret-key-min-32-chars!
 JWT_ALGORITHM=HS256
@@ -439,26 +488,17 @@ QWEN_MODEL_ID=Qwen/Qwen3-VL-2B-Instruct
 QUANTIZATION=4bit
 ```
 
-### Step 3: Start Supporting Infrastructure
+#### Step 3: Start Supporting Infrastructure
 
-AMG provides automatic Docker container management. When the FastAPI service or ingestion scripts start, [`docker_manager.py`] and [`redis_manager.py`] verify Docker and launch Qdrant and Redis automatically.
+AMG provides automatic Docker container management. When the FastAPI service or ingestion scripts start, [`docker_manager.py`], [`redis_manager.py`], and [`graph/neo4j_manager.py`] verify Docker and launch Qdrant, Redis, and Neo4j automatically.
 
-Alternatively, launch them manually:
+Alternatively, launch supporting containers via Compose without the API:
 
 ```bash
-# Launch Qdrant
-docker run -d --name amg-qdrant \
-  -p 6333:6333 \
-  -v amg_qdrant_storage:/qdrant/storage \
-  qdrant/qdrant:latest
-
-# Launch Redis
-docker run -d --name amg-redis \
-  -p 6380:6379 \
-  redis:7-alpine
+docker compose up -d qdrant redis neo4j
 ```
 
-### Step 4: Start the FastAPI Server
+#### Step 4: Start the FastAPI Server
 
 ```bash
 python api.py

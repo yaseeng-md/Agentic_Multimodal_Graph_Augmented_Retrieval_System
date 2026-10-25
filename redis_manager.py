@@ -385,6 +385,36 @@ def ensure_redis_running(*, timeout_seconds: int = DOCKER_START_TIMEOUT) -> dict
     commonly used ports. The container's internal Redis port remains 6379.
     Existing containers are never deleted automatically.
     """
+    try:
+        if redis_client.ping():
+            return {
+                "status": "ready",
+                "container": REDIS_CONTAINER_NAME,
+                "host": REDIS_HOST,
+                "port": REDIS_PORT,
+                "url": f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
+            }
+    except Exception:
+        pass
+
+    if os.getenv("RUNNING_IN_DOCKER", "").lower() in ("true", "1", "yes"):
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                if redis_client.ping():
+                    return {
+                        "status": "ready",
+                        "container": REDIS_CONTAINER_NAME,
+                        "host": REDIS_HOST,
+                        "port": REDIS_PORT,
+                        "url": f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
+                    }
+            except Exception:
+                time.sleep(1)
+        raise RedisError(
+            f"Redis did not respond at {REDIS_HOST}:{REDIS_PORT} within {timeout_seconds} seconds."
+        )
+
     if not shutil.which("docker"):
         raise RedisError(
             "Docker CLI was not found in PATH. Install Docker Desktop and reopen "

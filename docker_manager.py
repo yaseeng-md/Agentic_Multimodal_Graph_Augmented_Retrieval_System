@@ -64,6 +64,22 @@ def start_docker_desktop():
     raise RuntimeError("Docker daemon did not become ready.")
 
 
+def is_qdrant_ready() -> bool:
+    """Check if Qdrant REST API is already responding."""
+    try:
+        response = httpx.get(
+            f"{QDRANT_URL.rstrip('/')}/collections",
+            headers=(
+                {"api-key": QDRANT_API_KEY}
+                if QDRANT_API_KEY else None
+            ),
+            timeout=2,
+        )
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
 def wait_for_qdrant():
     """Wait until the Qdrant REST API responds."""
     print(f"Waiting for Qdrant at {QDRANT_URL}...")
@@ -71,20 +87,10 @@ def wait_for_qdrant():
     deadline = time.monotonic() + API_TIMEOUT
 
     while time.monotonic() < deadline:
-        try:
-            response = httpx.get(
-                f"{QDRANT_URL.rstrip('/')}/collections",
-                headers=(
-                    {"api-key": QDRANT_API_KEY}
-                    if QDRANT_API_KEY else None
-                ),
-                timeout=2,
-            )
-            response.raise_for_status()
+        if is_qdrant_ready():
             print("Qdrant is ready.")
             return
-        except httpx.HTTPError:
-            time.sleep(2)
+        time.sleep(2)
 
     raise RuntimeError(
         f"Qdrant did not respond at {QDRANT_URL} "
@@ -95,6 +101,14 @@ def wait_for_qdrant():
 def start_qdrant():
     """Create or start Qdrant, then wait for its API."""
     global _started_by_this_process
+
+    if is_qdrant_ready():
+        print(f"Qdrant is already reachable at {QDRANT_URL}.")
+        return None
+
+    if os.getenv("RUNNING_IN_DOCKER", "").lower() in ("true", "1", "yes"):
+        wait_for_qdrant()
+        return None
 
     client = start_docker_desktop()
 
