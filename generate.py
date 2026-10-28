@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 import torch
 from dotenv import load_dotenv
@@ -38,6 +38,7 @@ from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
     Qwen3VLForConditionalGeneration,
+    TextIteratorStreamer,
 )
 
 # Existing retrieval implementation.
@@ -863,6 +864,214 @@ class QwenGenerator:
 
         return response
 
+    def stream_from_retrieval(
+        self,
+        query: str,
+        retrieval_result: dict[str, Any],
+    ) -> Iterator[dict[str, Any]]:
+        if not query or not query.strip():
+            raise ValueError(
+                "query must be a non-empty string"
+            )
+
+        pages = _build_generation_pages(
+            retrieval_result
+        )
+
+        if not pages:
+            raise RuntimeError(
+                "No usable retrieved pages were available "
+                "for generation."
+            )
+
+        messages = _build_messages(
+            query=query,
+            pages=pages,
+        )
+
+        started = time.perf_counter()
+
+        lock = (
+            self._generation_lock
+            if GENERATOR_SERIALIZE
+            else _NoOpLock()
+        )
+
+        with lock:
+            inputs = None
+            try:
+                self._load_model()
+
+                assert self.model is not None
+                assert self.processor is not None
+
+                text = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+                image_inputs, video_inputs, video_kwargs = (
+                    process_vision_info(
+                        messages,
+                        image_patch_size=16,
+                        return_video_kwargs=True,
+                        return_video_metadata=True,
+                    )
+                )
+
+                video_metadata = None
+
+                if video_inputs is not None:
+                    video_inputs, video_metadata = zip(
+                        *video_inputs
+                    )
+                    video_inputs = list(video_inputs)
+                    video_metadata = list(video_metadata)
+
+                inputs = self.processor(
+                    text=text,
+                    images=image_inputs,
+                    videos=video_inputs,
+                    video_metadata=video_metadata,
+                    padding=True,
+                    return_tensors="pt",
+                    do_resize=False,
+                    **video_kwargs,
+                )
+
+                inputs = inputs.to(self.model.device)
+
+                tokenizer = getattr(
+                    self.processor, "tokenizer", self.processor
+                )
+                streamer = TextIteratorStreamer(
+                    tokenizer,
+                    skip_prompt=True,
+                    skip_special_tokens=True,
+                )
+
+                generation_kwargs: dict[str, Any] = {
+                    "max_new_tokens": GENERATOR_MAX_NEW_TOKENS,
+                    "use_cache": True,
+                    "streamer": streamer,
+                }
+
+                if GENERATOR_TEMPERATURE > 0:
+                    generation_kwargs.update(
+                        {
+                            "do_sample": True,
+                            "temperature": GENERATOR_TEMPERATURE,
+                            "top_p": GENERATOR_TOP_P,
+                        }
+                    )
+                else:
+                    generation_kwargs["do_sample"] = False
+
+                logger.info(
+                    "Starting streaming generation. GPU memory before generate: %s",
+                    _cuda_memory_snapshot(),
+                )
+
+                generation_error: list[Exception] = []
+
+                def _generate_worker():
+                    try:
+                        with torch.inference_mode():
+                            self.model.generate(
+                                **inputs,
+                                **generation_kwargs,
+                            )
+                    except Exception as err:
+                        generation_error.append(err)
+                    finally:
+                        streamer.text_queue.put(streamer.stop_signal)
+
+                generation_thread = threading.Thread(target=_generate_worker)
+                generation_thread.start()
+
+                accumulated_text: list[str] = []
+                ttft_ms: Optional[float] = None
+
+                for new_text in streamer:
+                    if new_text:
+                        if ttft_ms is None:
+                            ttft_ms = round(
+                                (time.perf_counter() - started) * 1000,
+                                2,
+                            )
+                        accumulated_text.append(new_text)
+                        yield {
+                            "type": "token",
+                            "token": new_text,
+                            "ttft_ms": ttft_ms,
+                        }
+
+                generation_thread.join()
+
+                if generation_error:
+                    raise generation_error[0]
+
+                answer = "".join(accumulated_text).strip()
+                duration_ms = round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                )
+
+                response_data = {
+                    "answer": answer,
+                    "sources": _build_sources(pages),
+                    "generation": {
+                        "model_id": _model_source(),
+                        "prequantized": GENERATOR_PREQUANTIZED,
+                        "quantization": (
+                            (
+                                "bitsandbytes_4bit_"
+                                f"{GENERATOR_BNB_4BIT_QUANT_TYPE}"
+                            )
+                            if GENERATOR_USE_4BIT
+                            else "none"
+                        ),
+                        "compute_dtype": (
+                            GENERATOR_BNB_4BIT_COMPUTE_DTYPE
+                            if GENERATOR_USE_4BIT
+                            else "auto"
+                        ),
+                        "context_pages": len(pages),
+                        "images_used": sum(
+                            1
+                            for page in pages
+                            if page["page_image_path"]
+                        ),
+                        "min_pixels": GENERATOR_MIN_PIXELS,
+                        "max_pixels": GENERATOR_MAX_PIXELS,
+                        "max_new_tokens": GENERATOR_MAX_NEW_TOKENS,
+                        "duration_ms": duration_ms,
+                        "ttft_ms": (
+                            ttft_ms if ttft_ms is not None else duration_ms
+                        ),
+                        "retrieval_scope": retrieval_result.get(
+                            "scope"
+                        ),
+                        "retrieval_result_count": retrieval_result.get(
+                            "result_count"
+                        ),
+                    },
+                    "latency_ms": duration_ms,
+                    "ttft_ms": ttft_ms if ttft_ms is not None else duration_ms,
+                }
+
+                yield {
+                    "type": "complete",
+                    "data": response_data,
+                }
+
+            finally:
+                if inputs is not None:
+                    del inputs
+                if GENERATOR_RELEASE_AFTER_GENERATION:
+                    self._release_model()
+
 
 # ===========================================================================
 # Process-local generator
@@ -981,6 +1190,96 @@ def generate_answer(
     return asdict(result)
 
 
+def generate_answer_stream(
+    query: str,
+    retrieval_result: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """
+    Stream tokens from an already completed retrieve() call.
+
+    Honors GENERATOR_RELEASE_RETRIEVER for callers that
+    retrieved data before entering this module.
+    """
+    if GENERATOR_RELEASE_RETRIEVER:
+        release_query_encoder()
+        _cleanup_cuda_memory()
+
+    generator = get_generator()
+    yield from generator.stream_from_retrieval(
+        query=query,
+        retrieval_result=retrieval_result,
+    )
+
+
+def query_and_generate_stream(
+    query: str,
+    document_ids: Optional[Sequence[str]] = None,
+    version_ids: Optional[Sequence[str]] = None,
+    recursive_search: bool = False,
+    top_k: int = 5,
+    enable_rerank: Optional[bool] = None,
+    rerank_threshold: Optional[float] = None,
+    retrieval_top_k: Optional[int] = None,
+    enable_graph: Optional[bool] = None,
+) -> Iterator[dict[str, Any]]:
+    """
+    Multimodal generation streaming pipeline:
+    1. Retrieval combining ColPali visual vectors and Neo4j knowledge graph.
+    2. Candidate page deduplication with provenance retention.
+    3. Optional Jina multimodal reranking on merged page candidates.
+    4. GPU memory cleanup (release ColPali encoder).
+    5. Qwen3-VL streaming grounded generation.
+    """
+    should_rerank = (
+        GENERATOR_ENABLE_RERANK if enable_rerank is None else enable_rerank
+    )
+    cutoff_threshold = (
+        GENERATOR_RERANK_THRESHOLD
+        if rerank_threshold is None
+        else rerank_threshold
+    )
+    fetch_top_k = (
+        (retrieval_top_k or GENERATOR_RERANK_RETRIEVAL_TOP_K)
+        if should_rerank
+        else top_k
+    )
+
+    retrieval_result = retrieve(
+        query=query,
+        document_ids=document_ids,
+        version_ids=version_ids,
+        recursive_search=recursive_search,
+        top_k=fetch_top_k,
+        enable_rerank=should_rerank,
+        rerank_threshold=cutoff_threshold,
+        retrieval_top_k=fetch_top_k,
+        enable_graph=enable_graph,
+    )
+
+    rerank_metadata = retrieval_result.get("rerank", {})
+
+    logger.info(
+        "Retrieval completed for streaming (rerank=%s). GPU memory: %s",
+        should_rerank,
+        _cuda_memory_snapshot(),
+    )
+
+    if GENERATOR_RELEASE_RETRIEVER:
+        release_query_encoder()
+        _cleanup_cuda_memory()
+
+    generator = get_generator()
+    for event in generator.stream_from_retrieval(
+        query=query,
+        retrieval_result=retrieval_result,
+    ):
+        if event.get("type") == "complete" and rerank_metadata:
+            complete_data = event.get("data", {})
+            if "generation" in complete_data:
+                complete_data["generation"]["rerank"] = rerank_metadata
+        yield event
+
+
 # ===========================================================================
 # JSON helper
 # ===========================================================================
@@ -1074,6 +1373,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional JSON output file.",
     )
 
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream generated tokens to stdout in real-time.",
+    )
+
     return parser
 
 
@@ -1087,6 +1392,29 @@ def main() -> None:
     )
 
     args = _build_parser().parse_args()
+
+    if args.stream:
+        for event in query_and_generate_stream(
+            query=args.query,
+            document_ids=args.document_ids,
+            version_ids=args.version_ids,
+            recursive_search=args.recursive_search,
+            top_k=args.top_k,
+            enable_rerank=args.enable_rerank,
+            rerank_threshold=args.rerank_threshold,
+            retrieval_top_k=args.retrieval_top_k,
+            enable_graph=getattr(args, "enable_graph", None),
+        ):
+            if event["type"] == "token":
+                print(event["token"], end="", flush=True)
+            elif event["type"] == "complete":
+                print(
+                    "\n\n"
+                    + json.dumps(
+                        event["data"], indent=2, ensure_ascii=False, default=str
+                    )
+                )
+        return
 
     result = query_and_generate(
         query=args.query,

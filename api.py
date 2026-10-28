@@ -23,13 +23,14 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Header, HTTPException, status, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingest import DATA_DIR, REGISTRY_DB_PATH, IngestJob, ingest_files
 from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
 from query import retrieve
-from generate import generate_answer, GENERATOR_MODEL
+from generate import generate_answer, generate_answer_stream, GENERATOR_MODEL
 from authorization import AuthContext, authenticate_user, create_user, get_current_user
 from redis_manager import (
     answer_cache_key,
@@ -2374,7 +2375,245 @@ def create_generate_job(
         ) from exc
 
 
-    
+@app.post("/generate/stream")
+def create_generate_stream(
+    request: QueryRequest,
+    current_user: AuthContext = Depends(get_current_user),
+) -> StreamingResponse:
+    """
+    Stream generated answer tokens incrementally via Server-Sent Events (SSE).
+
+    Protocol:
+        event: token
+        data: {"token": "..."}
+
+        event: complete
+        data: {
+            "answer": "...",
+            "sources": [...],
+            "generation": {...},
+            "latency_ms": 1234.5,
+            "ttft_ms": 450.2
+        }
+
+        event: error
+        data: {"error": "..."}
+    """
+    authenticated_request = build_authenticated_query_request(
+        request,
+        current_user,
+    )
+
+    def event_stream_generator() -> Iterator[str]:
+        generate_job_id = new_generate_job_id()
+        created_at = utc_now()
+        started_at = utc_now()
+
+        generate_job_store.create_job(
+            generate_job_id=generate_job_id,
+            request=authenticated_request,
+        )
+        generate_job_store.mark_running(generate_job_id)
+
+        retrieval_result: dict[str, Any] | None = None
+        ans_cache_key: str | None = None
+
+        try:
+            # 1. Retrieval (with Redis cache)
+            cache_key = retrieval_cache_key(
+                organization=authenticated_request.organization,
+                user_id=authenticated_request.user_id,
+                role=authenticated_request.role,
+                query=authenticated_request.query,
+                document_ids=authenticated_request.document_ids,
+                version_ids=authenticated_request.version_ids,
+                recursive_search=authenticated_request.recursive_search,
+                top_k=authenticated_request.top_k,
+            )
+            try:
+                retrieval_result = cache_get_json(cache_key)
+            except Exception:
+                retrieval_result = None
+
+            if retrieval_result is None:
+                retrieval_result = retrieve(
+                    query=authenticated_request.query,
+                    document_ids=authenticated_request.document_ids,
+                    version_ids=authenticated_request.version_ids,
+                    recursive_search=authenticated_request.recursive_search,
+                    top_k=authenticated_request.top_k,
+                    enable_rerank=getattr(
+                        authenticated_request, "enable_rerank", False
+                    ),
+                    rerank_threshold=getattr(
+                        authenticated_request, "rerank_threshold", 0.75
+                    ),
+                    retrieval_top_k=getattr(
+                        authenticated_request, "retrieval_top_k", 20
+                    ),
+                    enable_graph=getattr(
+                        authenticated_request, "enable_graph", None
+                    ),
+                )
+                try:
+                    cache_set_json(cache_key, retrieval_result)
+                except Exception:
+                    pass
+
+            # 2. Check Answer cache
+            ans_cache_key = answer_cache_key(
+                organization=authenticated_request.organization,
+                user_id=authenticated_request.user_id,
+                role=authenticated_request.role,
+                query=authenticated_request.query,
+                retrieval_result=retrieval_result,
+                model_id=GENERATOR_MODEL,
+            )
+            try:
+                cached_answer = cache_get_json(ans_cache_key)
+            except Exception:
+                cached_answer = None
+
+            if cached_answer is not None and isinstance(cached_answer, dict):
+                answer_text = cached_answer.get("answer", "")
+                sources = cached_answer.get("sources", [])
+                gen_meta = dict(cached_answer.get("generation", {}))
+                gen_meta["cached"] = True
+
+                token_payload = {"token": answer_text}
+                yield f"event: token\ndata: {json.dumps(token_payload, ensure_ascii=False)}\n\n"
+
+                complete_data = {
+                    "answer": answer_text,
+                    "sources": sources,
+                    "generation": gen_meta,
+                    "latency_ms": 1.0,
+                    "ttft_ms": 1.0,
+                    "cached": True,
+                }
+                yield f"event: complete\ndata: {json.dumps(complete_data, ensure_ascii=False)}\n\n"
+
+                generate_job_store.mark_completed(
+                    generate_job_id, cached_answer
+                )
+                try:
+                    job_record = generate_job_store.get_job(generate_job_id)
+                    if job_record:
+                        set_job_state("generate", generate_job_id, job_record)
+                except Exception:
+                    pass
+
+                save_generate_log(
+                    generate_job_id=generate_job_id,
+                    request=authenticated_request,
+                    status_value="completed",
+                    created_at=created_at,
+                    started_at=started_at,
+                    finished_at=utc_now(),
+                    retrieval=retrieval_result,
+                    response=cached_answer,
+                    error=None,
+                )
+                return
+
+            # 3. Stream from model
+            final_response = None
+            rerank_metadata = (
+                retrieval_result.get("rerank", {})
+                if isinstance(retrieval_result, dict)
+                else {}
+            )
+
+            for event in generate_answer_stream(
+                query=authenticated_request.query,
+                retrieval_result=retrieval_result,
+            ):
+                event_type = event.get("type")
+                if event_type == "token":
+                    token_payload = {"token": event.get("token", "")}
+                    yield f"event: token\ndata: {json.dumps(token_payload, ensure_ascii=False)}\n\n"
+                elif event_type == "complete":
+                    complete_payload = event.get("data", {})
+                    if rerank_metadata and "generation" in complete_payload:
+                        complete_payload["generation"]["rerank"] = (
+                            rerank_metadata
+                        )
+
+                    final_response = {
+                        "answer": complete_payload.get("answer", ""),
+                        "sources": complete_payload.get("sources", []),
+                        "generation": complete_payload.get("generation", {}),
+                    }
+                    yield f"event: complete\ndata: {json.dumps(complete_payload, ensure_ascii=False)}\n\n"
+
+            if final_response:
+                try:
+                    if ans_cache_key:
+                        cache_set_json(ans_cache_key, final_response)
+                except Exception:
+                    pass
+
+                generate_job_store.mark_completed(
+                    generate_job_id, final_response
+                )
+                completed_job = generate_job_store.get_job(generate_job_id)
+                try:
+                    if completed_job:
+                        set_job_state(
+                            "generate", generate_job_id, completed_job
+                        )
+                except Exception:
+                    pass
+
+                save_generate_log(
+                    generate_job_id=generate_job_id,
+                    request=authenticated_request,
+                    status_value="completed",
+                    created_at=created_at,
+                    started_at=started_at,
+                    finished_at=utc_now(),
+                    retrieval=retrieval_result,
+                    response=final_response,
+                    error=None,
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "Streaming generation failed for job %s", generate_job_id
+            )
+            generate_job_store.mark_failed(generate_job_id, str(exc))
+            failed_job = generate_job_store.get_job(generate_job_id)
+            try:
+                if failed_job:
+                    set_job_state("generate", generate_job_id, failed_job)
+            except Exception:
+                pass
+
+            save_generate_log(
+                generate_job_id=generate_job_id,
+                request=authenticated_request,
+                status_value="failed",
+                created_at=created_at,
+                started_at=started_at,
+                finished_at=utc_now(),
+                retrieval=retrieval_result,
+                response=None,
+                error=str(exc),
+            )
+            error_payload = {"error": str(exc)}
+            yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/generate/{generate_job_id}")
 def get_generate_job(
     generate_job_id: str,

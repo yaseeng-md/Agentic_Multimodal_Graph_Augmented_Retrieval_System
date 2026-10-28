@@ -867,6 +867,63 @@ curl -X GET http://localhost:8000/generate/gen_20261022104800_c3d4e5f6 \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+#### C. Real-Time Streaming Generation (`POST /generate/stream`)
+
+Streams tokens incrementally via Server-Sent Events (SSE) using Hugging Face `TextIteratorStreamer` and FastAPI `StreamingResponse`. Reduces Time-To-First-Token (TTFT) from ~10s to <1s.
+
+```bash
+curl -N -X POST http://localhost:8000/generate/stream \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "user_id": "usr_94b5f889",
+    "organization": "AMG-Research",
+    "role": "researcher",
+    "query": "What was the operating cash flow in Q3?",
+    "top_k": 2
+  }'
+```
+
+##### Server-Sent Events (SSE) Stream Output:
+```http
+event: token
+data: {"token": "Based"}
+
+event: token
+data: {"token": " on"}
+
+event: token
+data: {"token": " the"}
+
+event: token
+data: {"token": " financial"}
+
+...
+
+event: complete
+data: {
+  "answer": "Based on the financial statement on page 3, the operating cash flow in Q3 was $142.5M...",
+  "sources": [
+    {
+      "source_id": "S1",
+      "rank": 1,
+      "score": 0.892,
+      "document_id": "doc_e3f28d8b",
+      "page_number": 3,
+      "page_image_path": "data/pages/doc_e3f28d8b/ver_01f92e3a/page_3.png"
+    }
+  ],
+  "generation": {
+    "model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "duration_ms": 3120.4,
+    "ttft_ms": 780.2
+  },
+  "latency_ms": 3120.4,
+  "ttft_ms": 780.2
+}
+```
+
 ---
 
 ### 5. Document Listing & Health Inspection
