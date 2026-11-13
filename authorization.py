@@ -656,12 +656,15 @@ def create_access_token(
         "jti": str(uuid.uuid4()),
         "type": "access",
     }
-
-    return jwt.encode(
+    
+    jwt_access_token = jwt.encode(
         payload,
         _jwt_secret(),
         algorithm=JWT_ALGORITHM,
     )
+    print(f"Created access token for user_id={user_id} with lifetime={lifetime_minutes} minutes.")
+    print(f"Token: {jwt_access_token}")
+    return jwt_access_token
 
 
 def decode_access_token(token: str) -> dict[str, Any]:

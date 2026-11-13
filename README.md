@@ -25,7 +25,8 @@ Traditional RAG architectures rely on text extraction and Optical Character Reco
    - [Document Ingestion (`POST /ingest_document`)](#2-document-ingestion-post-ingest_document)
    - [Document Query / Retrieval (`POST /query`)](#3-document-retrieval-post-query)
    - [Multimodal Answer Generation (`POST /generate`)](#4-multimodal-answer-generation-post-generate)
-   - [Document Listing & Health Inspection](#5-document-listing--health-inspection)
+   - [Multi-Turn Conversation Management (`conversation_id`)](#5-multi-turn-conversation-management-conversation_id)
+   - [Document Listing & Health Inspection](#6-document-listing--health-inspection)
 7. [Hardware & VRAM Optimization](#hardware--vram-optimization)
 8. [License & Acknowledgments](#license--acknowledgments)
 
@@ -926,7 +927,49 @@ data: {
 
 ---
 
-### 5. Document Listing & Health Inspection
+### 5. Multi-Turn Conversation Management (`conversation_id`)
+
+AMG automatically tracks and persists conversational context across follow-up queries. All questions, grounded answers, retrieved sources, and generation metadata are recorded under a unique `conversation_id`.
+
+- If `conversation_id` is omitted in `POST /generate` or `POST /generate/stream`, a new conversation ID (e.g. `conv_20261112100000_a1b2c3d4`) is automatically assigned and returned.
+- If an existing `conversation_id` is provided in subsequent requests, previous turns are loaded and injected into Qwen's context for coreference resolution and follow-up answering.
+
+#### A. Follow-up Generation Request
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "usr_94b5f889",
+    "organization": "AMG-Research",
+    "role": "researcher",
+    "query": "And how does that compare with Q2?",
+    "conversation_id": "conv_20261112100000_a1b2c3d4",
+    "top_k": 3
+  }'
+```
+
+#### B. List Conversations (`GET /conversations`)
+```bash
+curl -X GET "http://localhost:8000/conversations?limit=20&offset=0" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### C. Get Conversation History & Turns (`GET /conversations/{conversation_id}`)
+```bash
+curl -X GET http://localhost:8000/conversations/conv_20261112100000_a1b2c3d4 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### D. Delete Conversation (`DELETE /conversations/{conversation_id}`)
+```bash
+curl -X DELETE http://localhost:8000/conversations/conv_20261112100000_a1b2c3d4 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+### 6. Document Listing & Health Inspection
 
 #### List Ingested Documents & Versions (`GET /list_documents`)
 

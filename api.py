@@ -31,6 +31,11 @@ from registry import Registry
 from docker_manager import start_qdrant, stop_qdrant
 from query import retrieve
 from generate import generate_answer, generate_answer_stream, GENERATOR_MODEL
+from conversation_manager import (
+    get_conversation_store,
+    validate_conversation_id,
+    new_conversation_id,
+)
 from authorization import AuthContext, authenticate_user, create_user, get_current_user
 from redis_manager import (
     answer_cache_key,
@@ -237,6 +242,23 @@ class QueryRequest(BaseModel):
     rerank_threshold: float = 0.75
     retrieval_top_k: int = 20
     enable_graph: bool | None = None
+    conversation_id: str | None = None
+
+    @field_validator("conversation_id")
+    @classmethod
+    def validate_conv_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if len(value) > 128:
+            raise ValueError("conversation_id must be at most 128 characters")
+        if not re.match(r"^[a-zA-Z0-9_\-\.]{1,128}$", value):
+            raise ValueError(
+                "conversation_id contains invalid characters. Allowed: alphanumeric, _, -, ."
+            )
+        return value
 
     @field_validator("user_id", "organization", "role", "query")
     @classmethod
@@ -463,10 +485,17 @@ class GenerateJobStore:
                     started_at TEXT,
                     finished_at TEXT,
                     result TEXT,
-                    error TEXT
+                    error TEXT,
+                    conversation_id TEXT
                 )
                 """
             )
+            try:
+                conn.execute(
+                    "ALTER TABLE generate_jobs ADD COLUMN conversation_id TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def create_job(
         self,
@@ -488,9 +517,10 @@ class GenerateJobStore:
                     recursive_search,
                     top_k,
                     status,
-                    created_at
+                    created_at,
+                    conversation_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     generate_job_id,
@@ -503,6 +533,7 @@ class GenerateJobStore:
                     int(request.recursive_search),
                     request.top_k,
                     utc_now(),
+                    getattr(request, "conversation_id", None),
                 ),
             )
 
@@ -584,6 +615,9 @@ class GenerateJobStore:
             "organization": row["organization"],
             "role": row["role"],
             "query": row["query"],
+            "conversation_id": (
+                row["conversation_id"] if "conversation_id" in row.keys() else None
+            ),
             "document_ids": json.loads(row["document_ids"]),
             "version_ids": json.loads(row["version_ids"]),
             "recursive_search": bool(row["recursive_search"]),
@@ -1448,7 +1482,20 @@ def _run_generate_job(
             except Exception:
                 pass
 
-        # Stage 2: generation (with Redis answer cache)
+        # Stage 2: generation (with multi-turn history & Redis answer cache)
+        conv_store = get_conversation_store()
+        conv, _ = conv_store.get_or_create_conversation(
+            conversation_id=getattr(request, "conversation_id", None),
+            user_id=request.user_id,
+            organization=request.organization,
+        )
+        conversation_id = conv.conversation_id
+        history = conv_store.get_conversation_turns(
+            conversation_id,
+            user_id=request.user_id,
+            organization=request.organization,
+        )
+
         ans_cache_key = answer_cache_key(
             organization=request.organization,
             user_id=request.user_id,
@@ -1457,6 +1504,9 @@ def _run_generate_job(
             retrieval_result=retrieval_result,
             model_id=GENERATOR_MODEL,
         )
+        if history:
+            ans_cache_key += f":conv:{conversation_id}:turns:{len(history)}"
+
         try:
             response = cache_get_json(ans_cache_key)
         except Exception:
@@ -1466,6 +1516,8 @@ def _run_generate_job(
             response = generate_answer(
                 query=request.query,
                 retrieval_result=retrieval_result,
+                conversation_history=history,
+                conversation_id=conversation_id,
             )
             try:
                 cache_set_json(ans_cache_key, response)
@@ -1475,6 +1527,26 @@ def _run_generate_job(
         if not isinstance(response, dict):
             raise RuntimeError(
                 "generate_answer() returned an invalid result."
+            )
+
+        response["conversation_id"] = conversation_id
+
+        # Save turn to persistent conversation store
+        try:
+            conv_store.add_turn(
+                conversation_id=conversation_id,
+                user_id=request.user_id,
+                organization=request.organization,
+                query=request.query,
+                answer=response.get("answer", ""),
+                sources=response.get("sources", []),
+                generation_metadata=response.get("generation", {}),
+            )
+        except Exception:
+            logger.warning(
+                "Could not record turn for conversation %s",
+                conversation_id,
+                exc_info=True,
             )
 
         generate_job_store.mark_completed(
@@ -1720,6 +1792,11 @@ def build_authenticated_query_request(
         version_ids=request.version_ids,
         recursive_search=request.recursive_search,
         top_k=request.top_k,
+        enable_rerank=request.enable_rerank,
+        rerank_threshold=request.rerank_threshold,
+        retrieval_top_k=request.retrieval_top_k,
+        enable_graph=request.enable_graph,
+        conversation_id=request.conversation_id,
     )
 
 
@@ -2460,7 +2537,22 @@ def create_generate_stream(
                 except Exception:
                     pass
 
-            # 2. Check Answer cache
+            # 2. Check Answer cache with conversation scoping
+            conv_store = get_conversation_store()
+            conv, _ = conv_store.get_or_create_conversation(
+                conversation_id=getattr(
+                    authenticated_request, "conversation_id", None
+                ),
+                user_id=authenticated_request.user_id,
+                organization=authenticated_request.organization,
+            )
+            conversation_id = conv.conversation_id
+            history = conv_store.get_conversation_turns(
+                conversation_id,
+                user_id=authenticated_request.user_id,
+                organization=authenticated_request.organization,
+            )
+
             ans_cache_key = answer_cache_key(
                 organization=authenticated_request.organization,
                 user_id=authenticated_request.user_id,
@@ -2469,12 +2561,16 @@ def create_generate_stream(
                 retrieval_result=retrieval_result,
                 model_id=GENERATOR_MODEL,
             )
+            if history:
+                ans_cache_key += f":conv:{conversation_id}:turns:{len(history)}"
+
             try:
                 cached_answer = cache_get_json(ans_cache_key)
             except Exception:
                 cached_answer = None
 
             if cached_answer is not None and isinstance(cached_answer, dict):
+                cached_answer["conversation_id"] = conversation_id
                 answer_text = cached_answer.get("answer", "")
                 sources = cached_answer.get("sources", [])
                 gen_meta = dict(cached_answer.get("generation", {}))
@@ -2486,6 +2582,7 @@ def create_generate_stream(
                 complete_data = {
                     "answer": answer_text,
                     "sources": sources,
+                    "conversation_id": conversation_id,
                     "generation": gen_meta,
                     "latency_ms": 1.0,
                     "ttft_ms": 1.0,
@@ -2527,6 +2624,8 @@ def create_generate_stream(
             for event in generate_answer_stream(
                 query=authenticated_request.query,
                 retrieval_result=retrieval_result,
+                conversation_history=history,
+                conversation_id=conversation_id,
             ):
                 event_type = event.get("type")
                 if event_type == "token":
@@ -2539,14 +2638,33 @@ def create_generate_stream(
                             rerank_metadata
                         )
 
+                    complete_payload["conversation_id"] = conversation_id
+
                     final_response = {
                         "answer": complete_payload.get("answer", ""),
                         "sources": complete_payload.get("sources", []),
+                        "conversation_id": conversation_id,
                         "generation": complete_payload.get("generation", {}),
                     }
                     yield f"event: complete\ndata: {json.dumps(complete_payload, ensure_ascii=False)}\n\n"
 
             if final_response:
+                try:
+                    conv_store.add_turn(
+                        conversation_id=conversation_id,
+                        user_id=authenticated_request.user_id,
+                        organization=authenticated_request.organization,
+                        query=authenticated_request.query,
+                        answer=final_response.get("answer", ""),
+                        sources=final_response.get("sources", []),
+                        generation_metadata=final_response.get("generation", {}),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record turn for streaming conversation %s",
+                        conversation_id,
+                        exc_info=True,
+                    )
                 try:
                     if ans_cache_key:
                         cache_set_json(ans_cache_key, final_response)
@@ -2703,6 +2821,106 @@ def get_generate_job(
 
     # Completed: ONLY return the actual generated result.
     return job["result"]
+
+
+# ===========================================================================
+# Conversation Management Endpoints
+# ===========================================================================
+
+@app.get("/conversations")
+def list_user_conversations(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    List persistent multi-turn conversations for the authenticated user and organization.
+    """
+    store = get_conversation_store()
+    bounded_limit = max(1, min(limit, 100))
+    bounded_offset = max(0, offset)
+    conversations = store.list_conversations(
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+        limit=bounded_limit,
+        offset=bounded_offset,
+    )
+    total = store.count_conversations(
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+    )
+    return {
+        "conversations": conversations,
+        "total": total,
+        "limit": bounded_limit,
+        "offset": bounded_offset,
+    }
+
+
+@app.get("/conversations/{conversation_id}")
+def get_user_conversation(
+    conversation_id: str,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    Retrieve full history, turns, queries, answers, and sources for a given conversation ID.
+    Enforces tenant and user isolation.
+    """
+    store = get_conversation_store()
+    try:
+        cid = validate_conversation_id(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    conv = store.get_conversation(
+        cid,
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+    )
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation '{conversation_id}' not found.",
+        )
+    return conv.to_dict()
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_user_conversation(
+    conversation_id: str,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    Delete a conversation and all its associated Q&A turns.
+    Enforces tenant and user isolation.
+    """
+    store = get_conversation_store()
+    try:
+        cid = validate_conversation_id(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    deleted = store.delete_conversation(
+        cid,
+        user_id=current_user.user_id,
+        organization=current_user.organization_name,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation '{conversation_id}' not found.",
+        )
+    return {
+        "status": "deleted",
+        "conversation_id": cid,
+        "message": f"Conversation '{cid}' deleted successfully.",
+    }
 
 
 if __name__ == "__main__":

@@ -77,6 +77,9 @@ DEFAULT_IDEMPOTENCY_TTL = int(os.getenv("REDIS_IDEMPOTENCY_TTL", "86400"))
 DEFAULT_IDEMPOTENCY_RESERVATION_TTL = int(
     os.getenv("REDIS_IDEMPOTENCY_RESERVATION_TTL", "120")
 )
+DEFAULT_CONVERSATION_TTL = int(
+    os.getenv("REDIS_CONVERSATION_TTL", "3600")  # 60 minutes
+)
 
 KEY_PREFIX = "amg"
 CACHE_SCHEMA_VERSION = "v1"
@@ -534,6 +537,11 @@ def cache_delete(key: str) -> int:
     return redis_client.delete(key)
 
 
+def conversation_cache_key(conversation_id: str) -> str:
+    """Cache key for fast multi-turn conversation retrieval with 60-min TTL."""
+    return f"{KEY_PREFIX}:conv:{conversation_id.strip()}"
+
+
 def retrieval_cache_key(
     *,
     organization: str,
@@ -764,11 +772,11 @@ def _idempotency_key(identity: str, endpoint: str, client_key: str) -> str:
 
 def reserve_idempotency(
     *,
-    identity: str,
-    endpoint: str,
-    idempotency_key: str,
-    payload: Any,
-    job_id: str,
+    identity: str, # organization : role
+    endpoint: str, # /generate or /ingest_document
+    idempotency_key: str, # comes from header 
+    payload: Any, # request body
+    job_id: str, 
     reservation_ttl_seconds: int = DEFAULT_IDEMPOTENCY_RESERVATION_TTL,
 ) -> dict[str, Any]:
     """Atomically reserve a logical request.
@@ -804,7 +812,7 @@ def reserve_idempotency(
         canonical_json(record),
         reservation_ttl_seconds,
     )
-    created = int(result[0]) == 1
+    created = int(result[0]) == 1 # result[0] = 1 : created, else it already exists
     try:
         existing_record = json.loads(str(result[1]))
     except (TypeError, json.JSONDecodeError) as exc:
@@ -812,7 +820,7 @@ def reserve_idempotency(
 
     if created:
         state = "new"
-    elif existing_record.get("request_hash") != request_hash:
+    elif existing_record.get("request_hash") != request_hash: # Check if request body matches or not 
         state = "conflict"
     else:
         state = "existing"

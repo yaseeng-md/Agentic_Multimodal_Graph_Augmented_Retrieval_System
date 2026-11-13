@@ -248,6 +248,7 @@ class GenerationResponse:
     answer: str
     sources: list[dict[str, Any]]
     generation: dict[str, Any]
+    conversation_id: Optional[str] = None
 
 
 # ===========================================================================
@@ -441,27 +442,50 @@ def _build_generation_pages(
 def _build_messages(
     query: str,
     pages: Sequence[dict[str, Any]],
+    conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
 ) -> list[dict[str, Any]]:
+    history_block = ""
+    if conversation_history:
+        if isinstance(conversation_history, str):
+            formatted_history = conversation_history.strip()
+        else:
+            try:
+                from conversation_manager import format_conversation_history
+                formatted_history = format_conversation_history(conversation_history)
+            except Exception:
+                formatted_history = ""
+        if formatted_history:
+            history_block = f"\n\nPRIOR CONVERSATION HISTORY:\n{formatted_history}\n"
+
+    system_rules = (
+        "You are the answer-generation stage of a multimodal RAG system.\n\n"
+        "Answer the user's question ONLY from the retrieved document pages below"
+        + (" and the prior conversation history if relevant.\n\n" if history_block else ".\n\n")
+        + "Rules:\n"
+        "1. Do not use outside knowledge.\n"
+        "2. Do not invent facts, numbers, page numbers, document IDs, versions, or quotes.\n"
+        "3. Use extracted text for textual evidence.\n"
+        "4. Use the page image when visual/layout information is relevant.\n"
+        "5. If evidence is insufficient, explicitly say so.\n"
+        "6. Keep the answer concise.\n"
+        "7. [S1], [S2], etc. refer to the supplied retrieved pages.\n"
+    )
+
+    if history_block:
+        system_rules += (
+            "8. If the current question is a follow-up referring to earlier context (e.g. pronouns like 'it', 'they', 'that', or comparative questions), use the conversation history to resolve references while strictly grounding answers in the supplied retrieved sources.\n"
+        )
+
+    user_question_text = (
+        f"{history_block}\nCURRENT USER QUESTION:\n{query.strip()}"
+        if history_block
+        else f"USER QUESTION:\n{query.strip()}"
+    )
+
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": (
-                "You are the answer-generation stage of a multimodal "
-                "RAG system.\n\n"
-                "Answer the user's question ONLY from the retrieved "
-                "document pages below.\n\n"
-                "Rules:\n"
-                "1. Do not use outside knowledge.\n"
-                "2. Do not invent facts, numbers, page numbers, document "
-                "IDs, versions, or quotes.\n"
-                "3. Use extracted text for textual evidence.\n"
-                "4. Use the page image when visual/layout information is "
-                "relevant.\n"
-                "5. If evidence is insufficient, explicitly say so.\n"
-                "6. Keep the answer concise.\n"
-                "7. [S1], [S2], etc. refer to the supplied retrieved pages.\n\n"
-                f"USER QUESTION:\n{query.strip()}"
-            ),
+            "text": f"{system_rules}\n{user_question_text}",
         }
     ]
 
@@ -692,6 +716,8 @@ class QwenGenerator:
         self,
         query: str,
         retrieval_result: dict[str, Any],
+        conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+        conversation_id: Optional[str] = None,
     ) -> GenerationResponse:
         if not query or not query.strip():
             raise ValueError(
@@ -711,6 +737,7 @@ class QwenGenerator:
         messages = _build_messages(
             query=query,
             pages=pages,
+            conversation_history=conversation_history,
         )
 
         started = time.perf_counter()
@@ -857,6 +884,7 @@ class QwenGenerator:
                     "result_count"
                 ),
             },
+            conversation_id=conversation_id,
         )
 
         if GENERATOR_RELEASE_AFTER_GENERATION:
@@ -868,6 +896,8 @@ class QwenGenerator:
         self,
         query: str,
         retrieval_result: dict[str, Any],
+        conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+        conversation_id: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
         if not query or not query.strip():
             raise ValueError(
@@ -887,6 +917,7 @@ class QwenGenerator:
         messages = _build_messages(
             query=query,
             pages=pages,
+            conversation_history=conversation_history,
         )
 
         started = time.perf_counter()
@@ -1021,6 +1052,7 @@ class QwenGenerator:
                 response_data = {
                     "answer": answer,
                     "sources": _build_sources(pages),
+                    "conversation_id": conversation_id,
                     "generation": {
                         "model_id": _model_source(),
                         "prequantized": GENERATOR_PREQUANTIZED,
@@ -1106,6 +1138,10 @@ def query_and_generate(
     rerank_threshold: Optional[float] = None,
     retrieval_top_k: Optional[int] = None,
     enable_graph: Optional[bool] = None,
+    conversation_id: Optional[str] = None,
+    conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+    user_id: Optional[str] = None,
+    organization: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Multimodal generation pipeline:
@@ -1113,7 +1149,8 @@ def query_and_generate(
     2. Candidate page deduplication with provenance retention.
     3. Optional Jina multimodal reranking (jina-reranker-m0) on merged page candidates.
     4. GPU memory cleanup (release ColPali encoder).
-    5. Qwen3-VL-2B-Instruct multimodal grounded generation with graph context.
+    5. Qwen3-VL-2B-Instruct multimodal grounded generation with graph context
+       and multi-turn conversation history.
     """
     should_rerank = GENERATOR_ENABLE_RERANK if enable_rerank is None else enable_rerank
     cutoff_threshold = GENERATOR_RERANK_THRESHOLD if rerank_threshold is None else rerank_threshold
@@ -1148,19 +1185,59 @@ def query_and_generate(
         _cuda_memory_snapshot(),
     )
 
+    cid = conversation_id
+    history = conversation_history
+    if cid and history is None:
+        try:
+            from conversation_manager import get_conversation_store
+            store = get_conversation_store()
+            history = store.get_conversation_turns(
+                cid, user_id=user_id, organization=organization
+            )
+        except Exception:
+            logger.warning(
+                "Could not load history for conversation %s",
+                cid,
+                exc_info=True,
+            )
+            history = None
+
     generator = get_generator()
 
     generation_result = generator.generate_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        conversation_history=history,
+        conversation_id=cid,
     )
 
     res_dict = asdict(generation_result)
     if rerank_metadata and "generation" in res_dict:
         res_dict["generation"]["rerank"] = rerank_metadata
 
+    if cid:
+        try:
+            from conversation_manager import get_conversation_store
+            store = get_conversation_store()
+            store.add_turn(
+                conversation_id=cid,
+                user_id=user_id or "default_user",
+                organization=organization or "default_org",
+                query=query,
+                answer=res_dict.get("answer", ""),
+                sources=res_dict.get("sources", []),
+                generation_metadata=res_dict.get("generation", {}),
+            )
+        except Exception:
+            logger.warning(
+                "Could not record turn for conversation %s",
+                cid,
+                exc_info=True,
+            )
+
     return {
         "query": query,
+        "conversation_id": cid,
         "retrieval": retrieval_result,
         "response": res_dict,
     }
@@ -1169,6 +1246,8 @@ def query_and_generate(
 def generate_answer(
     query: str,
     retrieval_result: dict[str, Any],
+    conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+    conversation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Generate from an already completed retrieve() call.
@@ -1185,6 +1264,8 @@ def generate_answer(
     result = generator.generate_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        conversation_history=conversation_history,
+        conversation_id=conversation_id,
     )
 
     return asdict(result)
@@ -1193,6 +1274,8 @@ def generate_answer(
 def generate_answer_stream(
     query: str,
     retrieval_result: dict[str, Any],
+    conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+    conversation_id: Optional[str] = None,
 ) -> Iterator[dict[str, Any]]:
     """
     Stream tokens from an already completed retrieve() call.
@@ -1208,6 +1291,8 @@ def generate_answer_stream(
     yield from generator.stream_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        conversation_history=conversation_history,
+        conversation_id=conversation_id,
     )
 
 
@@ -1221,6 +1306,10 @@ def query_and_generate_stream(
     rerank_threshold: Optional[float] = None,
     retrieval_top_k: Optional[int] = None,
     enable_graph: Optional[bool] = None,
+    conversation_id: Optional[str] = None,
+    conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+    user_id: Optional[str] = None,
+    organization: Optional[str] = None,
 ) -> Iterator[dict[str, Any]]:
     """
     Multimodal generation streaming pipeline:
@@ -1228,7 +1317,7 @@ def query_and_generate_stream(
     2. Candidate page deduplication with provenance retention.
     3. Optional Jina multimodal reranking on merged page candidates.
     4. GPU memory cleanup (release ColPali encoder).
-    5. Qwen3-VL streaming grounded generation.
+    5. Qwen3-VL streaming grounded generation with conversation history.
     """
     should_rerank = (
         GENERATOR_ENABLE_RERANK if enable_rerank is None else enable_rerank
@@ -1268,16 +1357,57 @@ def query_and_generate_stream(
         release_query_encoder()
         _cleanup_cuda_memory()
 
+    cid = conversation_id
+    history = conversation_history
+    if cid and history is None:
+        try:
+            from conversation_manager import get_conversation_store
+            store = get_conversation_store()
+            history = store.get_conversation_turns(
+                cid, user_id=user_id, organization=organization
+            )
+        except Exception:
+            logger.warning(
+                "Could not load history for streaming conversation %s",
+                cid,
+                exc_info=True,
+            )
+            history = None
+
     generator = get_generator()
+    final_complete_data = None
     for event in generator.stream_from_retrieval(
         query=query,
         retrieval_result=retrieval_result,
+        conversation_history=history,
+        conversation_id=cid,
     ):
-        if event.get("type") == "complete" and rerank_metadata:
+        if event.get("type") == "complete":
             complete_data = event.get("data", {})
-            if "generation" in complete_data:
+            if rerank_metadata and "generation" in complete_data:
                 complete_data["generation"]["rerank"] = rerank_metadata
+            final_complete_data = complete_data
         yield event
+
+    if cid and final_complete_data:
+        try:
+            from conversation_manager import get_conversation_store
+            store = get_conversation_store()
+            store.add_turn(
+                conversation_id=cid,
+                user_id=user_id or "default_user",
+                organization=organization or "default_org",
+                query=query,
+                answer=final_complete_data.get("answer", ""),
+                sources=final_complete_data.get("sources", []),
+                generation_metadata=final_complete_data.get("generation", {}),
+            )
+        except Exception:
+            logger.warning(
+                "Could not record turn for streaming conversation %s",
+                cid,
+                exc_info=True,
+            )
 
 
 # ===========================================================================
@@ -1379,6 +1509,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stream generated tokens to stdout in real-time.",
     )
 
+    parser.add_argument(
+        "--conversation-id",
+        default=None,
+        help="Conversation ID to maintain multi-turn dialog history across queries.",
+    )
+
     return parser
 
 
@@ -1404,6 +1540,7 @@ def main() -> None:
             rerank_threshold=args.rerank_threshold,
             retrieval_top_k=args.retrieval_top_k,
             enable_graph=getattr(args, "enable_graph", None),
+            conversation_id=args.conversation_id,
         ):
             if event["type"] == "token":
                 print(event["token"], end="", flush=True)
@@ -1425,6 +1562,7 @@ def main() -> None:
         enable_rerank=args.enable_rerank,
         rerank_threshold=args.rerank_threshold,
         retrieval_top_k=args.retrieval_top_k,
+        conversation_id=args.conversation_id,
     )
 
     print(
