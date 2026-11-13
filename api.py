@@ -21,6 +21,7 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from collections.abc import Iterator
 
 from fastapi import FastAPI, Header, HTTPException, status, Depends
 from fastapi.responses import StreamingResponse

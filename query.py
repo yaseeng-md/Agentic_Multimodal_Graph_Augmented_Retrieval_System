@@ -515,6 +515,7 @@ def _merge_retrieval_candidates(
     return merged_list[:limit]
 
 
+
 # ---------------------------------------------------------------------------
 # Public retrieval function
 # ---------------------------------------------------------------------------
@@ -527,71 +528,156 @@ def retrieve(
     enable_rerank: bool = False,
     rerank_threshold: float = DEFAULT_RERANK_RELEVANCE_THRESHOLD,
     retrieval_top_k: int = DEFAULT_RERANK_RETRIEVAL_TOP_K,
-    enable_graph: Optional[bool] = None,
+    enable_graph: Optional[bool] = True,
+    enable_visual: bool = True,
 ) -> dict[str, Any]:
     """
-    Retrieve the top-k relevant PDF pages for a text query, combining visual (ColPali)
-    and knowledge graph (Neo4j) retrieval with optional Jina multimodal reranking.
+    Retrieve relevant PDF pages using Graph, Visual or Hybrid retrieval.
+
+    Routing:
+        enable_graph=True,  enable_visual=False -> Graph
+        enable_graph=False, enable_visual=True  -> Visual
+        enable_graph=True,  enable_visual=True  -> Hybrid
+
+    Optional Jina multimodal reranking is supported.
     """
+
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string")
 
     if not isinstance(top_k, int) or top_k < 1:
         raise ValueError("top_k must be an integer >= 1")
 
+    if not isinstance(retrieval_top_k, int) or retrieval_top_k < 1:
+        raise ValueError("retrieval_top_k must be an integer >= 1")
+
+    # -----------------------------------------------------------------------
+    # 1. Resolve retrieval scope
+    # -----------------------------------------------------------------------
     scope = resolve_retrieval_scope(
         document_ids=document_ids,
         version_ids=version_ids,
         recursive_search=recursive_search,
     )
 
-    fetch_limit = max(top_k, retrieval_top_k) if enable_rerank else top_k
-
-    # Resolve graph retrieval flag
-    try:
-        from graph.config import GRAPH_RETRIEVAL_ENABLED
-        graph_active = GRAPH_RETRIEVAL_ENABLED if enable_graph is None else bool(enable_graph)
-    except Exception:
-        graph_active = False if enable_graph is None else bool(enable_graph)
-
-    print(f"[Retrieval] Query: {query}")
-    print(f"[Retrieval] Scope: {scope.mode}")
-    print(f"[Retrieval] Top-K: {top_k} (Fetch limit: {fetch_limit}, Rerank: {enable_rerank}, Graph: {graph_active})")
-
-    # 1. Path A: ColPali visual retrieval from Qdrant
-    encoder = get_query_encoder()
-    query_embedding = encoder.encode(query)
-
-    client = create_qdrant_client()
-    _check_collection(client)
-
-    query_filter = _build_qdrant_filter(scope)
-
-    response = client.query_points(
-        collection_name=QDRANT_COLLECTION,
-        query=query_embedding,
-        using=QDRANT_VECTOR_NAME,
-        query_filter=query_filter,
-        limit=fetch_limit,
-        with_payload=True,
-        with_vectors=False,
+    fetch_limit = (
+        max(top_k, retrieval_top_k)
+        if enable_rerank
+        else top_k
     )
 
-    visual_candidates = [
-        _serialise_point(point, rank=index)
-        for index, point in enumerate(response.points, start=1)
-    ]
+    # -----------------------------------------------------------------------
+    # 2. Resolve retrieval flags
+    # -----------------------------------------------------------------------
+    try:
+        from graph.config import GRAPH_RETRIEVAL_ENABLED
 
-    # 2. Path B: Knowledge graph retrieval from Neo4j
-    graph_metadata: dict[str, Any] = {"enabled": graph_active}
+        graph_active = (
+            GRAPH_RETRIEVAL_ENABLED
+            if enable_graph is None
+            else bool(enable_graph)
+        )
+
+    except Exception:
+        graph_active = (
+            False if enable_graph is None else bool(enable_graph)
+        )
+
+    visual_active = bool(enable_visual)
+
+    if not graph_active and not visual_active:
+        raise ValueError(
+            "At least one retrieval mechanism must be enabled."
+        )
+
+    if graph_active and visual_active:
+        retrieval_strategy = "hybrid"
+    elif graph_active:
+        retrieval_strategy = "graph"
+    else:
+        retrieval_strategy = "visual"
+
+    print(f"[Retrieval] Query: {query}")
+    print(f"[Retrieval] Strategy: {retrieval_strategy}")
+    print(f"[Retrieval] Scope: {scope.mode}")
+    print(
+        f"[Retrieval] Top-K: {top_k} "
+        f"(Fetch limit: {fetch_limit}, "
+        f"Rerank: {enable_rerank}, "
+        f"Graph: {graph_active}, "
+        f"Visual: {visual_active})"
+    )
+
+    # Initialize candidates regardless of selected strategy.
+    visual_candidates: list[dict[str, Any]] = []
     graph_pages: list[dict[str, Any]] = []
 
+    # -----------------------------------------------------------------------
+    # 3. Path A: Visual retrieval using ColPali + Qdrant
+    # -----------------------------------------------------------------------
+    if visual_active:
+
+        print("[Retrieval] Executing Visual Retrieval...")
+
+        encoder = get_query_encoder()
+        query_embedding = encoder.encode(query)
+
+        client = create_qdrant_client()
+        _check_collection(client)
+
+        query_filter = _build_qdrant_filter(scope)
+
+        response = client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_embedding,
+            using=QDRANT_VECTOR_NAME,
+            query_filter=query_filter,
+            limit=fetch_limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        visual_candidates = [
+            _serialise_point(point, rank=index)
+            for index, point in enumerate(
+                response.points,
+                start=1
+            )
+        ]
+
+        print(
+            f"[Retrieval] Visual candidates: "
+            f"{len(visual_candidates)}"
+        )
+
+    # -----------------------------------------------------------------------
+    # 4. Path B: Graph retrieval using Neo4j
+    # -----------------------------------------------------------------------
+    graph_metadata: dict[str, Any] = {
+        "enabled": graph_active,
+        "status": "not_executed"
+    }
+
     if graph_active:
+
+        print("[Retrieval] Executing Graph Retrieval...")
+
         try:
             from graph.retriever import GraphRetriever
+
             g_retriever = GraphRetriever()
-            doc_filter = list(scope.document_ids) if scope.mode == "documents_current_versions" else None
-            ver_filter = list(scope.version_ids) if scope.mode == "explicit_versions" else None
+
+            doc_filter = (
+                list(scope.document_ids)
+                if scope.mode == "documents_current_versions"
+                else None
+            )
+
+            ver_filter = (
+                list(scope.version_ids)
+                if scope.mode == "explicit_versions"
+                else None
+            )
 
             g_res = g_retriever.retrieve(
                 query=query,
@@ -600,69 +686,138 @@ def retrieve(
                 recursive_search=scope.recursive_search,
                 page_limit=fetch_limit,
             )
+
             graph_pages = g_res.source_pages
+
             graph_metadata.update({
                 "status": g_res.status,
                 "matched_entities": g_res.matched_entities,
                 "claims_count": len(g_res.claims),
-                "claims": [c.model_dump() for c in g_res.claims[:10]],
+                "claims": [
+                    c.model_dump()
+                    for c in g_res.claims[:10]
+                ],
                 "pages_found": len(g_res.source_pages),
                 "latency_ms": g_res.duration_ms,
             })
+
             if g_res.error:
                 graph_metadata["error"] = g_res.error
+
+            print(
+                f"[Retrieval] Graph pages: "
+                f"{len(graph_pages)}"
+            )
+
         except Exception as g_exc:
-            logger.warning("Graph retrieval failed gracefully: %s", g_exc)
+
+            logger.warning(
+                "Graph retrieval failed gracefully: %s",
+                g_exc
+            )
+
             graph_metadata.update({
                 "status": "service_unavailable",
                 "error": str(g_exc),
             })
 
-    # 3. Merge candidates (Union with deduplication & provenance retention)
-    if graph_pages:
+    # -----------------------------------------------------------------------
+    # 5. Merge candidates
+    # -----------------------------------------------------------------------
+    if graph_active and graph_pages:
+
         merged_candidates = _merge_retrieval_candidates(
             visual_candidates=visual_candidates,
             graph_candidates=graph_pages,
             limit=fetch_limit,
         )
+
     else:
         merged_candidates = visual_candidates
 
-    # 4. Multimodal Reranking via Jina (if enabled)
+        # Graph-only retrieval: use graph results directly.
+        if graph_active:
+            merged_candidates = graph_pages[:fetch_limit]
+
+    print(
+        f"[Retrieval] Total merged candidates: "
+        f"{len(merged_candidates)}"
+    )
+
+    # -----------------------------------------------------------------------
+    # 6. Optional Jina multimodal reranking
+    # -----------------------------------------------------------------------
     results = merged_candidates
     rerank_metadata: dict[str, Any] = {}
-    if enable_rerank:
+
+    if enable_rerank and merged_candidates:
+
         reranker = JinaReranker()
-        reranked_results, rerank_latency = reranker.rerank_retrieval_results(
-            query=query,
-            retrieval_candidates=merged_candidates,
-            threshold=rerank_threshold,
-            top_k=top_k,
+
+        reranked_results, rerank_latency = (
+            reranker.rerank_retrieval_results(
+                query=query,
+                retrieval_candidates=merged_candidates,
+                threshold=rerank_threshold,
+                top_k=top_k,
+            )
         )
+
         rerank_metadata = {
             "reranked": True,
             "rerank_model": reranker.model,
             "rerank_threshold": rerank_threshold,
-            "retrieval_candidates_count": len(merged_candidates),
-            "rerank_latency_ms": round(rerank_latency, 2),
+            "retrieval_candidates_count": len(
+                merged_candidates
+            ),
+            "rerank_latency_ms": round(
+                rerank_latency, 2
+            ),
         }
-        results = reranked_results
-    else:
-        results = results[:top_k]
 
+        results = reranked_results
+
+    elif enable_rerank:
+
+        results = []
+
+        rerank_metadata = {
+            "reranked": False,
+            "reason": "No retrieval candidates available"
+        }
+
+    else:
+        results = merged_candidates[:top_k]
+
+    # -----------------------------------------------------------------------
+    # 7. Build response
+    # -----------------------------------------------------------------------
     response_payload: dict[str, Any] = {
         "query": query,
+
+        "retrieval_strategy": retrieval_strategy,
+
+        "retrieval_flags": {
+            "enable_graph": graph_active,
+            "enable_visual": visual_active,
+        },
+
         "top_k": top_k,
+
         "scope": {
             "mode": scope.mode,
             "document_ids": list(scope.document_ids),
             "version_ids": list(scope.version_ids),
             "recursive_search": scope.recursive_search,
         },
+
         "result_count": len(results),
+
         "results": results,
+
         "graph": graph_metadata,
     }
+
     if rerank_metadata:
         response_payload["rerank"] = rerank_metadata
 
