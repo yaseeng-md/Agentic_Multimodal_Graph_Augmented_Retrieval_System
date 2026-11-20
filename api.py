@@ -75,15 +75,6 @@ S3_ALLOWED_HOSTS = {
     if host.strip()
 }
 
-QUERY_JOB_DB_PATH = Path(
-    os.getenv("QUERY_JOB_DB_PATH", str(DATA_DIR / "query_jobs.db"))
-)
-
-QUERY_LOG_DIR = Path(
-    os.getenv("QUERY_LOG_DIR", str(DATA_DIR / "query"))
-)
-QUERY_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
 GENERATE_JOB_DB_PATH = Path(
     os.getenv(
         "GENERATE_JOB_DB_PATH",
@@ -100,7 +91,6 @@ GENERATE_LOG_DIR = Path(
 GENERATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_ID_RE = re.compile(r"^ingest_[a-zA-Z0-9_-]+$")
-QUERY_JOB_ID_RE = re.compile(r"^query_[a-zA-Z0-9_-]+$")
 GENERATE_JOB_ID_RE = re.compile(r"^generate_[a-zA-Z0-9_-]+$")
 
 _executor: ThreadPoolExecutor | None = None
@@ -138,14 +128,6 @@ def get_executor() -> ThreadPoolExecutor:
             )
         return _executor
 
-
-
-def new_query_job_id() -> str:
-    return (
-        f"query_"
-        f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}_"
-        f"{uuid.uuid4().hex[:8]}"
-    )
 
 
 def new_generate_job_id() -> str:
@@ -288,170 +270,8 @@ class QueryRequest(BaseModel):
         return list(dict.fromkeys(cleaned))
 
 
-class QueryJobStore:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS query_jobs (
-                    query_job_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    organization TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    document_ids TEXT NOT NULL,
-                    version_ids TEXT NOT NULL,
-                    recursive_search INTEGER NOT NULL,
-                    top_k INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    result TEXT,
-                    error TEXT
-                )
-                """
-            )
-
-    def create_job(
-        self,
-        *,
-        query_job_id: str,
-        request: QueryRequest,
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO query_jobs (
-                    query_job_id,
-                    user_id,
-                    organization,
-                    role,
-                    query,
-                    document_ids,
-                    version_ids,
-                    recursive_search,
-                    top_k,
-                    status,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-                """,
-                (
-                    query_job_id,
-                    request.user_id,
-                    request.organization,
-                    request.role,
-                    request.query,
-                    json.dumps(request.document_ids),
-                    json.dumps(request.version_ids),
-                    int(request.recursive_search),
-                    request.top_k,
-                    utc_now(),
-                ),
-            )
-
-    def mark_running(self, query_job_id: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE query_jobs
-                SET status='running',
-                    started_at=?
-                WHERE query_job_id=?
-                """,
-                (utc_now(), query_job_id),
-            )
-
-    def mark_completed(
-        self,
-        query_job_id: str,
-        result: dict[str, Any],
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE query_jobs
-                SET status='completed',
-                    finished_at=?,
-                    result=?,
-                    error=NULL
-                WHERE query_job_id=?
-                """,
-                (
-                    utc_now(),
-                    json.dumps(result),
-                    query_job_id,
-                ),
-            )
-
-    def mark_failed(
-        self,
-        query_job_id: str,
-        error: str,
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE query_jobs
-                SET status='failed',
-                    finished_at=?,
-                    error=?
-                WHERE query_job_id=?
-                """,
-                (
-                    utc_now(),
-                    error,
-                    query_job_id,
-                ),
-            )
-
-    def get_job(self, query_job_id: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM query_jobs
-                WHERE query_job_id=?
-                """,
-                (query_job_id,),
-            ).fetchone()
-
-        if row is None:
-            return None
-
-        result = None
-
-        if row["result"]:
-            result = json.loads(row["result"])
-
-        return {
-            "query_job_id": row["query_job_id"],
-            "user_id": row["user_id"],
-            "organization": row["organization"],
-            "role": row["role"],
-            "query": row["query"],
-            "document_ids": json.loads(row["document_ids"]),
-            "version_ids": json.loads(row["version_ids"]),
-            "recursive_search": bool(row["recursive_search"]),
-            "top_k": row["top_k"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-            "started_at": row["started_at"],
-            "finished_at": row["finished_at"],
-            "result": result,
-            "error": row["error"],
-        }
+# Canonical alias for answering requests
+AnswerRequest = QueryRequest
 
 
 class GenerateJobStore:
@@ -956,7 +776,6 @@ class JobStore:
 
 
 job_store = JobStore(API_JOB_DB_PATH)
-query_job_store = QueryJobStore(QUERY_JOB_DB_PATH)
 generate_job_store = GenerateJobStore(GENERATE_JOB_DB_PATH)
 
 
@@ -1180,142 +999,6 @@ def _run_job(job_id: str, request: IngestRequest) -> None:
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-def _run_query_job( query_job_id: str, request: QueryRequest) -> None:
-
-    logger.info(
-        "Starting query job %s",
-        query_job_id,
-    )
-
-    query_job_store.mark_running(query_job_id)
-
-    # Get the persisted job so the log uses the same timestamps
-    job = query_job_store.get_job(query_job_id)
-
-    created_at = job["created_at"] if job else datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    started_at = job["started_at"] if job else datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    try:
-        cache_key = retrieval_cache_key(
-            organization=request.organization,
-            user_id=request.user_id,
-            role=request.role,
-            query=request.query,
-            document_ids=request.document_ids,
-            version_ids=request.version_ids,
-            recursive_search=request.recursive_search,
-            top_k=request.top_k,
-        )
-        result = None
-        try:
-            result = cache_get_json(cache_key)
-        except Exception:
-            result = None
-
-        if result is None:
-            result = retrieve(
-                query=request.query,
-                document_ids=request.document_ids,
-                version_ids=request.version_ids,
-                recursive_search=request.recursive_search,
-                top_k=request.top_k,
-                enable_rerank=getattr(request, "enable_rerank", False),
-                rerank_threshold=getattr(request, "rerank_threshold", 0.75),
-                retrieval_top_k=getattr(request, "retrieval_top_k", 20),
-                enable_graph=getattr(request, "enable_graph", None),
-            )
-            # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
-            try:
-                cache_set_json(cache_key, result)
-            except Exception:
-                pass
-
-        # Persist result in SQLite
-        query_job_store.mark_completed(
-            query_job_id,
-            result,
-        )
-
-        # Get final timestamp from DB
-        job = query_job_store.get_job(query_job_id)
-
-        finished_at = (
-            job["finished_at"]
-            if job
-            else datetime.now(timezone.utc).isoformat()
-        )
-
-        try:
-            if job:
-                set_job_state("query", query_job_id, job)
-        except Exception:
-            pass
-
-        # Save complete JSON audit/debug record
-        save_query_log(
-            query_job_id=query_job_id,
-            request=request,
-            status="completed",
-            created_at=created_at,
-            started_at=started_at,
-            finished_at=finished_at,
-            result=result,
-            error=None,
-        )
-
-        logger.info(
-            "Finished query job %s",
-            query_job_id,
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Query job failed: %s",
-            query_job_id,
-        )
-
-        # Persist error in SQLite
-        query_job_store.mark_failed(
-            query_job_id,
-            str(exc),
-        )
-
-        # Get final timestamp
-        job = query_job_store.get_job(query_job_id)
-
-        finished_at = (
-            job["finished_at"]
-            if job
-            else datetime.now(timezone.utc).isoformat()
-        )
-
-        try:
-            if job:
-                set_job_state("query", query_job_id, job)
-        except Exception:
-            pass
-
-        # Save failed query too
-        save_query_log(
-            query_job_id=query_job_id,
-            request=request,
-            status="failed",
-            created_at=created_at,
-            started_at=started_at,
-            finished_at=finished_at,
-            result=None,
-            error=str(exc),
-        )
-
-
-
-
 def save_generate_log(
     generate_job_id: str,
     request: QueryRequest,
@@ -1380,6 +1063,8 @@ def save_generate_log(
             "top_k": request.top_k,
         },
         "retrieval": retrieval,
+        "routing": response.get("routing") if isinstance(response, dict) else None,
+        "web_metadata": response.get("web_metadata") if isinstance(response, dict) else None,
         "execution": generation_metadata,
         "response": {
             "status": (
@@ -1428,7 +1113,6 @@ def _run_generate_job(
         "Starting generation job %s",
         generate_job_id,
     )
-
     generate_job_store.mark_running(generate_job_id)
 
     job = generate_job_store.get_job(generate_job_id)
@@ -1449,106 +1133,37 @@ def _run_generate_job(
     response: dict[str, Any] | None = None
 
     try:
-        # Stage 1: retrieval (with Redis cache)
-        cache_key = retrieval_cache_key(
-            organization=request.organization,
-            user_id=request.user_id,
-            role=request.role,
-            query=request.query,
-            document_ids=request.document_ids,
-            version_ids=request.version_ids,
-            recursive_search=request.recursive_search,
-            top_k=request.top_k,
-        )
-        try:
-            retrieval_result = cache_get_json(cache_key)
-        except Exception:
-            retrieval_result = None
+        from rag_workflow import run_rag_pipeline
 
-        if retrieval_result is None:
-            retrieval_result = retrieve(
-                query=request.query,
-                document_ids=request.document_ids,
-                version_ids=request.version_ids,
-                recursive_search=request.recursive_search,
-                top_k=request.top_k,
-                enable_rerank=getattr(request, "enable_rerank", False),
-                rerank_threshold=getattr(request, "rerank_threshold", 0.75),
-                retrieval_top_k=getattr(request, "retrieval_top_k", 20),
-                enable_graph=getattr(request, "enable_graph", None),
-            )
-            # shortcut: fire-and-forget redis cache; upgrade to persistent redis retry on cluster scale
-            try:
-                cache_set_json(cache_key, retrieval_result)
-            except Exception:
-                pass
+        pipeline_input: dict[str, Any] = {
+            "user_id": request.user_id,
+            "organization": request.organization,
+            "role": request.role,
+            "original_query": request.query,
+            "conversation_id": getattr(request, "conversation_id", None),
+            "document_ids": list(request.document_ids or []),
+            "version_ids": list(request.version_ids or []),
+            "recursive_search": request.recursive_search,
+            "top_k": request.top_k,
+            "enable_rerank": getattr(request, "enable_rerank", False),
+            "rerank_threshold": getattr(request, "rerank_threshold", 0.75),
+            "retrieval_top_k": getattr(request, "retrieval_top_k", 20),
+        }
 
-        # Stage 2: generation (with multi-turn history & Redis answer cache)
-        conv_store = get_conversation_store()
-        conv, _ = conv_store.get_or_create_conversation(
-            conversation_id=getattr(request, "conversation_id", None),
-            user_id=request.user_id,
-            organization=request.organization,
-        )
-        conversation_id = conv.conversation_id
-        history = conv_store.get_conversation_turns(
-            conversation_id,
-            user_id=request.user_id,
-            organization=request.organization,
-        )
+        final_state = run_rag_pipeline(pipeline_input)
+        conversation_id = final_state.get("conversation_id")
+        retrieval_result = final_state.get("retrieval_result")
 
-        ans_cache_key = answer_cache_key(
-            organization=request.organization,
-            user_id=request.user_id,
-            role=request.role,
-            query=request.query,
-            retrieval_result=retrieval_result,
-            model_id=GENERATOR_MODEL,
-        )
-        if history:
-            ans_cache_key += f":conv:{conversation_id}:turns:{len(history)}"
-
-        try:
-            response = cache_get_json(ans_cache_key)
-        except Exception:
-            response = None
-
-        if response is None:
-            response = generate_answer(
-                query=request.query,
-                retrieval_result=retrieval_result,
-                conversation_history=history,
-                conversation_id=conversation_id,
-            )
-            try:
-                cache_set_json(ans_cache_key, response)
-            except Exception:
-                pass
-
-        if not isinstance(response, dict):
-            raise RuntimeError(
-                "generate_answer() returned an invalid result."
-            )
-
-        response["conversation_id"] = conversation_id
-
-        # Save turn to persistent conversation store
-        try:
-            conv_store.add_turn(
-                conversation_id=conversation_id,
-                user_id=request.user_id,
-                organization=request.organization,
-                query=request.query,
-                answer=response.get("answer", ""),
-                sources=response.get("sources", []),
-                generation_metadata=response.get("generation", {}),
-            )
-        except Exception:
-            logger.warning(
-                "Could not record turn for conversation %s",
-                conversation_id,
-                exc_info=True,
-            )
+        gen_resp = final_state.get("generation_response") or {}
+        response = {
+            "answer": final_state.get("answer", "") or gen_resp.get("answer", ""),
+            "sources": final_state.get("aggregated_sources", []) or gen_resp.get("sources", []),
+            "conversation_id": conversation_id,
+            "generation": gen_resp.get("generation", {}),
+            "routing": final_state.get("routing_metadata", {}),
+            "retrieval_metadata": final_state.get("retrieval_metadata", {}),
+            "web_metadata": final_state.get("web_metadata", {}),
+        }
 
         generate_job_store.mark_completed(
             generate_job_id,
@@ -1626,117 +1241,6 @@ def _run_generate_job(
             response=response,
             error=str(exc),
         )
-
-
-def save_query_log(
-    query_job_id: str,
-    request: QueryRequest,
-    *,
-    status: str,
-    created_at: str,
-    started_at: str | None = None,
-    finished_at: str | None = None,
-    result: Any = None,
-    error: str | None = None,
-) -> None:
-    """
-    Save a complete query execution record for debugging,
-    auditing and fault-tolerance.
-    """
-
-    duration_ms = None
-
-    if started_at and finished_at:
-        try:
-            start_dt = datetime.fromisoformat(started_at)
-            finish_dt = datetime.fromisoformat(finished_at)
-            duration_ms = round(
-                (finish_dt - start_dt).total_seconds() * 1000,
-                3,
-            )
-        except Exception:
-            duration_ms = None
-
-    # Determine retrieval scope
-    if request.document_ids:
-        scope = "specified_documents"
-    elif request.version_ids:
-        scope = "specified_versions"
-    elif request.recursive_search:
-        scope = "all_documents_all_versions"
-    else:
-        scope = "latest_versions"
-
-    result_count = None
-
-    if isinstance(result, dict):
-        # Support common result formats.
-        if "result_count" in result:
-            result_count = result["result_count"]
-        elif isinstance(result.get("results"), list):
-            result_count = len(result["results"])
-
-    log_data = {
-        "job": {
-            "query_job_id": query_job_id,
-            "status": status,
-            "created_at": created_at,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "duration_ms": duration_ms,
-        },
-
-        "request": {
-            "user_id": request.user_id,
-            "organization": request.organization,
-            "role": request.role,
-            "query": request.query,
-            "document_ids": request.document_ids,
-            "version_ids": request.version_ids,
-            "recursive_search": request.recursive_search,
-            "top_k": request.top_k,
-        },
-
-        "retrieval": {
-            "scope": scope,
-            "result_count": result_count,
-        },
-
-        "execution": {
-            "model_id": "vidore/colpali-v1.3-merged",
-            "quantization": "bitsandbytes_4bit_nf4",
-            "embedding_type": "colpali_multivector",
-        },
-
-        "response": {
-            "status": "success" if status == "completed" else "failed",
-            "result": result,
-        },
-
-        "error": error,
-    }
-
-    log_path = QUERY_LOG_DIR / f"{query_job_id}.json"
-
-    # Atomic write:
-    # write temporary file first, then replace final file.
-    temp_path = QUERY_LOG_DIR / f".{query_job_id}.tmp"
-
-    with temp_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            log_data,
-            f,
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-
-    temp_path.replace(log_path)
-
-    logger.info(
-        "Saved query log: %s",
-        log_path,
-    )
 
 
 class AuthenticatedIngestRequest(IngestRequest):
@@ -2097,105 +1601,14 @@ def get_ingestion_job(
 
 
 @app.post(
-    "/query",
-    response_model=AcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
+    "/answer",
+    summary="Answer user query using multimodal RAG pipeline",
 )
-def create_query_job(
-    request: QueryRequest,
-    current_user: AuthContext = Depends(get_current_user),
-) -> AcceptedResponse:
-
-    authenticated_request = (
-        build_authenticated_query_request(
-            request,
-            current_user,
-        )
-    )
-
-    query_job_id = new_query_job_id()
-
-    try:
-        query_job_store.create_job(
-            query_job_id=query_job_id,
-            request=authenticated_request,
-        )
-
-        executor = get_executor()
-
-        executor.submit(
-            _run_query_job,
-            query_job_id,
-            authenticated_request,
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "Could not create query job"
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                f"Could not create query job: {exc}"
-            ),
-        ) from exc
-
-    return AcceptedResponse(
-        job_id=query_job_id,
-        status="accepted",
-        message="Query job accepted.",
-    )
-
-@app.get("/query/{query_job_id}")
-def get_query_job(
-    query_job_id: str,
-    current_user: AuthContext = Depends(get_current_user),
-) -> dict[str, Any]:
-
-    if not QUERY_JOB_ID_RE.fullmatch(query_job_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid query_job_id format",
-        )
-
-    # shortcut: check fast Redis job state cache first; fall back to SQLite durable store
-    try:
-        cached = get_job_state("query", query_job_id)
-        if cached["user_id"] != current_user.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this job.",
-            )
-
-        if cached:
-            return cached
-    except Exception:
-        pass
-
-    job = query_job_store.get_job(query_job_id)
-
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Query job not found: {query_job_id}",
-        )
-    
-    if job["user_id"] != current_user.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this job.",
-        )
-
-    try:
-        set_job_state("query", query_job_id, job)
-    except Exception:
-        pass
-
-    return job
-
-
-@app.post("/generate")
+@app.post(
+    "/generate",
+    summary="Legacy alias for /answer",
+    include_in_schema=False,
+)
 def create_generate_job(
     request: QueryRequest,
     idempotency_key: str | None = Header(
@@ -2453,7 +1866,15 @@ def create_generate_job(
         ) from exc
 
 
-@app.post("/generate/stream")
+@app.post(
+    "/answer/stream",
+    summary="Stream answer tokens via Server-Sent Events (SSE)",
+)
+@app.post(
+    "/generate/stream",
+    summary="Legacy alias for /answer/stream",
+    include_in_schema=False,
+)
 def create_generate_stream(
     request: QueryRequest,
     current_user: AuthContext = Depends(get_current_user),
@@ -2497,48 +1918,7 @@ def create_generate_stream(
         ans_cache_key: str | None = None
 
         try:
-            # 1. Retrieval (with Redis cache)
-            cache_key = retrieval_cache_key(
-                organization=authenticated_request.organization,
-                user_id=authenticated_request.user_id,
-                role=authenticated_request.role,
-                query=authenticated_request.query,
-                document_ids=authenticated_request.document_ids,
-                version_ids=authenticated_request.version_ids,
-                recursive_search=authenticated_request.recursive_search,
-                top_k=authenticated_request.top_k,
-            )
-            try:
-                retrieval_result = cache_get_json(cache_key)
-            except Exception:
-                retrieval_result = None
-
-            if retrieval_result is None:
-                retrieval_result = retrieve(
-                    query=authenticated_request.query,
-                    document_ids=authenticated_request.document_ids,
-                    version_ids=authenticated_request.version_ids,
-                    recursive_search=authenticated_request.recursive_search,
-                    top_k=authenticated_request.top_k,
-                    enable_rerank=getattr(
-                        authenticated_request, "enable_rerank", False
-                    ),
-                    rerank_threshold=getattr(
-                        authenticated_request, "rerank_threshold", 0.75
-                    ),
-                    retrieval_top_k=getattr(
-                        authenticated_request, "retrieval_top_k", 20
-                    ),
-                    enable_graph=getattr(
-                        authenticated_request, "enable_graph", None
-                    ),
-                )
-                try:
-                    cache_set_json(cache_key, retrieval_result)
-                except Exception:
-                    pass
-
-            # 2. Check Answer cache with conversation scoping
+            # 1. Load conversation context & previous retrieval evidence
             conv_store = get_conversation_store()
             conv, _ = conv_store.get_or_create_conversation(
                 conversation_id=getattr(
@@ -2548,17 +1928,144 @@ def create_generate_stream(
                 organization=authenticated_request.organization,
             )
             conversation_id = conv.conversation_id
-            history = conv_store.get_conversation_turns(
+            raw_history = conv_store.get_conversation_turns(
+                conversation_id,
+                user_id=authenticated_request.user_id,
+                organization=authenticated_request.organization,
+            )
+            history = [t.to_dict() for t in raw_history]
+            prev_retrieval = conv_store.get_last_retrieval_context(
                 conversation_id,
                 user_id=authenticated_request.user_id,
                 organization=authenticated_request.organization,
             )
 
+            # 2. External Query Routing (Qwen shared local model)
+            from external_query_router import get_external_query_router, ExternalRouterInput
+            router = get_external_query_router()
+            router_input = ExternalRouterInput(
+                query=authenticated_request.query,
+                conversation_history=history,
+                previous_retrieval_context=prev_retrieval,
+            )
+            decision, routing_metadata = router.route(router_input)
+
+            # 3. Handle Clarification if needed
+            if decision.clarification_required:
+                clarification_text = decision.clarification_question or (
+                    "Could you please clarify your question?"
+                )
+                yield f"event: token\ndata: {json.dumps({'token': clarification_text}, ensure_ascii=False)}\n\n"
+                complete_payload = {
+                    "answer": clarification_text,
+                    "sources": [],
+                    "conversation_id": conversation_id,
+                    "generation": {"status": "clarification_requested"},
+                    "routing": routing_metadata,
+                }
+                yield f"event: complete\ndata: {json.dumps(complete_payload, ensure_ascii=False)}\n\n"
+                try:
+                    conv_store.add_turn(
+                        conversation_id=conversation_id,
+                        user_id=authenticated_request.user_id,
+                        organization=authenticated_request.organization,
+                        query=authenticated_request.query,
+                        answer=clarification_text,
+                        sources=[],
+                        generation_metadata={"status": "clarification_requested"},
+                        routing_metadata=routing_metadata,
+                    )
+                except Exception:
+                    pass
+                generate_job_store.mark_completed(generate_job_id, complete_payload)
+                return
+
+            # 4. Execute Retrieval & Web Search
+            reused_sources = []
+            if decision.reuse_previous_evidence and prev_retrieval:
+                reused_sources = prev_retrieval.get("sources", [])
+
+            retrieval_metadata: dict[str, Any] = {}
+            retrieval_result = None
+            if "internal_retrieval" in decision.actions and (
+                not decision.reuse_previous_evidence or decision.additional_retrieval_required
+            ):
+                internal_q = decision.internal_query or decision.contextualized_query or authenticated_request.query
+                try:
+                    from external_query_router import InternalQueryRouter
+                    with InternalQueryRouter() as internal_router:
+                        strategy = internal_router.route(internal_q)
+                except Exception:
+                    strategy = "hybrid"
+
+                enable_graph = strategy in ("graph", "hybrid")
+                enable_visual = strategy in ("visual", "hybrid")
+
+                cache_key = retrieval_cache_key(
+                    organization=authenticated_request.organization,
+                    user_id=authenticated_request.user_id,
+                    role=authenticated_request.role,
+                    query=internal_q,
+                    document_ids=authenticated_request.document_ids,
+                    version_ids=authenticated_request.version_ids,
+                    recursive_search=authenticated_request.recursive_search,
+                    top_k=authenticated_request.top_k,
+                    enable_graph=enable_graph,
+                    enable_visual=enable_visual,
+                )
+                try:
+                    retrieval_result = cache_get_json(cache_key)
+                except Exception:
+                    retrieval_result = None
+
+                if retrieval_result is None:
+                    retrieval_result = retrieve(
+                        query=internal_q,
+                        document_ids=authenticated_request.document_ids,
+                        version_ids=authenticated_request.version_ids,
+                        recursive_search=authenticated_request.recursive_search,
+                        top_k=authenticated_request.top_k,
+                        enable_rerank=getattr(authenticated_request, "enable_rerank", False),
+                        rerank_threshold=getattr(authenticated_request, "rerank_threshold", 0.75),
+                        retrieval_top_k=getattr(authenticated_request, "retrieval_top_k", 20),
+                        enable_graph=enable_graph,
+                        enable_visual=enable_visual,
+                    )
+                    try:
+                        cache_set_json(cache_key, retrieval_result)
+                    except Exception:
+                        pass
+
+                retrieval_metadata = {
+                    "strategy": strategy,
+                    "enable_graph": enable_graph,
+                    "enable_visual": enable_visual,
+                    "query": internal_q,
+                    "result_count": len(retrieval_result.get("results", [])) if retrieval_result else 0,
+                }
+
+            # Web Search (Brave)
+            web_metadata: dict[str, Any] = {}
+            web_evidence_text = ""
+            if "web_search" in decision.actions:
+                from web_search import get_brave_search_client
+                web_q = decision.web_query or decision.contextualized_query or authenticated_request.query
+                web_resp = get_brave_search_client().search(web_q, count=5)
+                web_evidence_text = web_resp.format_evidence_text()
+                web_metadata = {
+                    "search_query": web_q,
+                    "status": web_resp.status,
+                    "result_count": web_resp.result_count,
+                    "latency_ms": web_resp.latency_ms,
+                    "sources": [{"title": i.title, "url": i.url} for i in web_resp.results],
+                }
+
+            # 5. Check Answer cache
             ans_cache_key = answer_cache_key(
                 organization=authenticated_request.organization,
                 user_id=authenticated_request.user_id,
                 role=authenticated_request.role,
-                query=authenticated_request.query,
+                query=decision.contextualized_query,
                 retrieval_result=retrieval_result,
                 model_id=GENERATOR_MODEL,
             )
@@ -2585,22 +2092,16 @@ def create_generate_stream(
                     "sources": sources,
                     "conversation_id": conversation_id,
                     "generation": gen_meta,
+                    "routing": routing_metadata,
+                    "retrieval_metadata": retrieval_metadata,
+                    "web_metadata": web_metadata,
                     "latency_ms": 1.0,
                     "ttft_ms": 1.0,
                     "cached": True,
                 }
                 yield f"event: complete\ndata: {json.dumps(complete_data, ensure_ascii=False)}\n\n"
 
-                generate_job_store.mark_completed(
-                    generate_job_id, cached_answer
-                )
-                try:
-                    job_record = generate_job_store.get_job(generate_job_id)
-                    if job_record:
-                        set_job_state("generate", generate_job_id, job_record)
-                except Exception:
-                    pass
-
+                generate_job_store.mark_completed(generate_job_id, cached_answer)
                 save_generate_log(
                     generate_job_id=generate_job_id,
                     request=authenticated_request,
@@ -2614,7 +2115,7 @@ def create_generate_stream(
                 )
                 return
 
-            # 3. Stream from model
+            # 6. Stream from model
             final_response = None
             rerank_metadata = (
                 retrieval_result.get("rerank", {})
@@ -2622,11 +2123,18 @@ def create_generate_stream(
                 else {}
             )
 
+            # Build aggregated sources
+            aggregated_sources = list(reused_sources)
+            if retrieval_result and "results" in retrieval_result:
+                aggregated_sources.extend(retrieval_result["results"])
+
             for event in generate_answer_stream(
-                query=authenticated_request.query,
-                retrieval_result=retrieval_result,
+                query=decision.contextualized_query,
+                retrieval_result=retrieval_result or {"results": aggregated_sources},
                 conversation_history=history,
                 conversation_id=conversation_id,
+                web_evidence=web_evidence_text if web_evidence_text else None,
+                allow_empty_pages=decision.direct_answer or bool(web_evidence_text),
             ):
                 event_type = event.get("type")
                 if event_type == "token":
@@ -2635,17 +2143,21 @@ def create_generate_stream(
                 elif event_type == "complete":
                     complete_payload = event.get("data", {})
                     if rerank_metadata and "generation" in complete_payload:
-                        complete_payload["generation"]["rerank"] = (
-                            rerank_metadata
-                        )
+                        complete_payload["generation"]["rerank"] = rerank_metadata
 
                     complete_payload["conversation_id"] = conversation_id
+                    complete_payload["routing"] = routing_metadata
+                    complete_payload["retrieval_metadata"] = retrieval_metadata
+                    complete_payload["web_metadata"] = web_metadata
 
                     final_response = {
                         "answer": complete_payload.get("answer", ""),
-                        "sources": complete_payload.get("sources", []),
+                        "sources": complete_payload.get("sources", []) or aggregated_sources,
                         "conversation_id": conversation_id,
                         "generation": complete_payload.get("generation", {}),
+                        "routing": routing_metadata,
+                        "retrieval_metadata": retrieval_metadata,
+                        "web_metadata": web_metadata,
                     }
                     yield f"event: complete\ndata: {json.dumps(complete_payload, ensure_ascii=False)}\n\n"
 
@@ -2659,6 +2171,9 @@ def create_generate_stream(
                         answer=final_response.get("answer", ""),
                         sources=final_response.get("sources", []),
                         generation_metadata=final_response.get("generation", {}),
+                        routing_metadata=routing_metadata,
+                        retrieval_metadata=retrieval_metadata,
+                        web_metadata=web_metadata,
                     )
                 except Exception:
                     logger.warning(
@@ -2733,7 +2248,15 @@ def create_generate_stream(
     )
 
 
-@app.get("/generate/{generate_job_id}")
+@app.get(
+    "/answer/{generate_job_id}",
+    summary="Fetch answer generation job by ID",
+)
+@app.get(
+    "/generate/{generate_job_id}",
+    summary="Legacy alias for /answer/{generate_job_id}",
+    include_in_schema=False,
+)
 def get_generate_job(
     generate_job_id: str,
     current_user: AuthContext = Depends(get_current_user),

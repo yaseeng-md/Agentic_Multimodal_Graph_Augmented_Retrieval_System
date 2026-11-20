@@ -105,8 +105,6 @@ services:
       - PAGE_IMAGE_DIR=/app/data/pages
       - API_JOB_DB_PATH=/app/data/ingestion_jobs.db
       - API_JOB_DATA_DIR=/app/data/api_jobs
-      - QUERY_JOB_DB_PATH=/app/data/query_jobs.db
-      - QUERY_LOG_DIR=/app/data/query
       - GENERATE_JOB_DB_PATH=/app/data/generate_jobs.db
       - GENERATE_LOG_DIR=/app/data/generate
       - DOCLING_CACHE_DIR=/app/data/docling_cache

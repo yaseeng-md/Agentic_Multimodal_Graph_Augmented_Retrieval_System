@@ -80,6 +80,9 @@ DEFAULT_IDEMPOTENCY_RESERVATION_TTL = int(
 DEFAULT_CONVERSATION_TTL = int(
     os.getenv("REDIS_CONVERSATION_TTL", "3600")  # 60 minutes
 )
+DEFAULT_ROUTER_DECISION_TTL = int(
+    os.getenv("ROUTER_DECISION_CACHE_TTL", os.getenv("REDIS_ROUTER_DECISION_TTL", "86400"))  # 24 hours
+)
 
 KEY_PREFIX = "amg"
 CACHE_SCHEMA_VERSION = "v1"
@@ -542,6 +545,22 @@ def conversation_cache_key(conversation_id: str) -> str:
     return f"{KEY_PREFIX}:conv:{conversation_id.strip()}"
 
 
+def router_decision_cache_key(
+    *,
+    query: str,
+    model: str,
+    checkpoint: str | None = None,
+) -> str:
+    """Generate a deterministic cache key for internal query routing decisions."""
+    normalized_query = " ".join(query.strip().lower().split())
+    payload = {
+        "query": normalized_query,
+        "model": (model or "").strip(),
+        "checkpoint": (checkpoint or "").strip(),
+    }
+    return make_cache_key("router_decision", payload)
+
+
 def retrieval_cache_key(
     *,
     organization: str,
@@ -553,11 +572,13 @@ def retrieval_cache_key(
     recursive_search: bool = False,
     top_k: int = 5,
     corpus_revision: str | None = None,
+    enable_graph: bool = True,
+    enable_visual: bool = True,
 ) -> str:
     """Build a tenant/user-scoped retrieval key; pass current version IDs/revision.
 
-    Including the authorization scope prevents accidentally reusing another
-    user's results. Prefer identities derived from verified authentication.
+    Including the authorization scope and strategy flags prevents accidentally
+    reusing mismatched results.
     """
     payload = {
         "organization": organization,
@@ -569,6 +590,8 @@ def retrieval_cache_key(
         "recursive_search": bool(recursive_search),
         "top_k": int(top_k),
         "corpus_revision": corpus_revision,
+        "enable_graph": bool(enable_graph),
+        "enable_visual": bool(enable_visual),
     }
     return make_cache_key("retrieval", payload)
 

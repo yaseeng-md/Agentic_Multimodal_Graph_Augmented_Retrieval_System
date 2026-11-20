@@ -17,18 +17,24 @@ Traditional RAG architectures rely on text extraction and Optical Character Reco
 
 1. [What is in this Repository?](#what-is-in-this-repository)
 2. [System Architecture](#system-architecture)
-3. [Evaluation Results & Benchmarks](#evaluation-results--benchmarks)
-4. [How to Use AMG (Setup & Quickstart)](#how-to-use-amg-setup--quickstart)
-5. [CLI Usage Guide](#cli-usage-guide)
-6. [API Reference & cURL Requests (Ingest & Generate)](#api-reference--curl-requests-ingest--generate)
+3. [Query Routing & LangGraph Workflow](#query-routing--langgraph-workflow)
+   - [Internal Query Router (Laya Model & Redis Decision Caching)](#internal-query-router-laya-model--redis-decision-caching)
+   - [Graph-to-Qdrant Retrieval Fallback](#graph-to-qdrant-retrieval-fallback)
+   - [External Query Router (Source Selection)](#external-query-router-source-selection)
+   - [LangGraph Execution Lifecycle](#langgraph-execution-lifecycle)
+4. [Configuration & Environment Variables](#configuration--environment-variables)
+5. [Evaluation Results & Benchmarks](#evaluation-results--benchmarks)
+6. [How to Use AMG (Setup & Quickstart)](#how-to-use-amg-setup--quickstart)
+7. [CLI Usage Guide](#cli-usage-guide)
+8. [API Reference & cURL Requests](#api-reference--curl-requests)
    - [Authentication (Create User & Login)](#1-authentication)
    - [Document Ingestion (`POST /ingest_document`)](#2-document-ingestion-post-ingest_document)
-   - [Document Query / Retrieval (`POST /query`)](#3-document-retrieval-post-query)
-   - [Multimodal Answer Generation (`POST /generate`)](#4-multimodal-answer-generation-post-generate)
-   - [Multi-Turn Conversation Management (`conversation_id`)](#5-multi-turn-conversation-management-conversation_id)
-   - [Document Listing & Health Inspection](#6-document-listing--health-inspection)
-7. [Hardware & VRAM Optimization](#hardware--vram-optimization)
-8. [License & Acknowledgments](#license--acknowledgments)
+   - [Multimodal Answer Generation (`POST /answer`)](#3-multimodal-answer-generation-post-answer-canonical)
+   - [Multi-Turn Conversation Management (`conversation_id`)](#4-multi-turn-conversation-management-conversation_id)
+   - [Document Listing & Health Inspection](#5-document-listing--health-inspection)
+   - [Decommissioned Endpoints Notice (`POST /query`)](#6-decommissioned-endpoints-notice-post-query)
+9. [Hardware & VRAM Optimization](#hardware--vram-optimization)
+10. [License & Acknowledgments](#license--acknowledgments)
 
 ---
 
@@ -38,16 +44,21 @@ The repository contains a production-ready, modular codebase supporting visual d
 
 ```text
 amg/
-├── api.py                    # FastAPI service exposing async ingestion, query, generation, and auth
-├── authorization.py          # User management, PBKDF2 password hashing, JWT creation & RBAC
+├── api.py                    # FastAPI service exposing canonical POST /answer, streaming, ingestion, auth
+├── conversation_manager.py   # Multi-turn conversation storage, turn persistence, and history retrieval
+├── external_query_router.py  # Context-aware external router (conversation search, internal retrieval, Brave web search)
+├── query_router.py           # Internal router: Laya model decisions (graph/visual/hybrid) & Redis decision caching
+├── rag_workflow.py           # LangGraph orchestration state machine coordinating the complete RAG lifecycle
+├── web_search.py             # Brave Search API integration for live web retrieval and snippets
+├── query.py                  # ColPali multi-vector retrieval, Neo4j graph search, merging & Qdrant fallback
+├── generate.py               # Multimodal QA pipeline combining visual context with Qwen3-VL-2B
 ├── ingest.py                 # PDF intake, PyMuPDF 150 DPI rendering, ColPali embedding, Qdrant upsert
-├── query.py                  # ColPali multi-vector query encoding and late-interaction MaxSim search
-├── generate.py               # Multimodal QA pipeline combining Qdrant context with Qwen3-VL-2B
+├── authorization.py          # User management, PBKDF2 password hashing, JWT creation & RBAC
 ├── docker_manager.py         # Automated Docker container lifecycle manager for Qdrant (port 6333)
-├── redis_manager.py          # Redis manager, RESP2 client, caching, idempotency, and distributed locks
+├── redis_manager.py          # Redis client, decision caching, result caching, idempotency, distributed locks
 ├── registry.py               # SQLite persistence layer for documents, versions, and page hashes
 ├── qdrant_store.py           # Qdrant client abstraction for multi-vector late-interaction collections
-├── test_server.py            # Comprehensive end-to-end test suite (11 endpoints, auth, idempotency)
+├── test_server.py            # Comprehensive end-to-end test suite (auth, ingestion, generation, idempotency)
 ├── utils/
 │   ├── reranker.py           # Jina AI multimodal reranker integration (jina-reranker-m0)
 │   └── visual_grounding.py   # Patch cross-attention mapping, bounding box extraction & heatmap overlays
@@ -96,26 +107,35 @@ flowchart TD
 
     subgraph APILayer["FastAPI Orchestration (api.py)"]
         AuthMiddleware["JWT Auth & RBAC (authorization.py)"]
-        Endpoints["REST Endpoints (/health, /ingest_document, /query, /generate)"]
-        JobStores["SQLite Durable Job Stores (ingestion, query, generate)"]
+        Endpoints["REST Endpoints (/health, /ingest_document, /answer, /conversations)"]
+        JobStores["SQLite Durable Job Stores (ingestion, generation)"]
         WorkerPool["Thread Pool Worker"]
+    end
+
+    subgraph OrchestrationLayer["Agentic Orchestration & Routing"]
+        LangGraph["LangGraph RAG StateGraph (rag_workflow.py)"]
+        ExtRouter["External Query Router (external_query_router.py)"]
+        IntRouter["Internal Query Router (query_router.py)"]
+        ConvStore["Conversation Store (conversation_manager.py)"]
     end
 
     subgraph ServiceCoordination["Coordination & Caching"]
         RedisManager["Redis Manager (redis_manager.py : 6380)"]
+        DecisionCache["Laya Decision Cache (ROUTER_DECISION_CACHE_TTL)"]
         Idempotency["Atomic Idempotency Engine"]
         ResultCache["Retrieval & Answer Cache"]
     end
 
-    subgraph PipelineLayer["Pipelines"]
-        IngestEngine["Ingestion Engine (ingest.py)"]
-        QueryEngine["Retrieval Engine (query.py)"]
-        GenEngine["Generation Engine (generate.py)"]
+    subgraph PipelineLayer["Retrieval & Search Engines"]
+        QueryEngine["Multimodal Retrieval & Fallback (query.py)"]
         GraphEngine["Graph Pipeline (graph/pipeline.py)"]
+        WebEngine["Brave Web Search (web_search.py)"]
+        GenEngine["Generation Engine (generate.py)"]
         DoclingProc["Docling Parser (graph/docling_processor.py)"]
     end
 
-    subgraph ModelsLayer["Inference & Extraction"]
+    subgraph ModelsLayer["Inference Models"]
+        LayaRouter["Laya Model (Router Classifier)"]
         ColPali["ColPali v1.3 Multivector Embedder (NF4)"]
         QwenVL["Qwen3-VL-2B-Instruct Generator (NF4)"]
         GraphExtractor["Schema-Validated Extractor (OpenRouter LLM)"]
@@ -123,6 +143,7 @@ flowchart TD
 
     subgraph StorageLayer["Persistence Layer"]
         RegistryDB[("SQLite Registry (ingestion_registry.db)")]
+        ConvDB[("SQLite Conversations (conversations.db)")]
         LocalStore["Local Disk (data/pdfs, data/pages, data/docling_cache)"]
         QdrantDB[("Qdrant Vector DB (:6333) MAX_SIM")]
         Neo4jDB[("Neo4j Knowledge Graph (:7687)")]
@@ -135,30 +156,28 @@ flowchart TD
     Endpoints --> JobStores
     Endpoints --> WorkerPool
 
-    WorkerPool --> IngestEngine
-    WorkerPool --> QueryEngine
-    WorkerPool --> GenEngine
+    WorkerPool --> LangGraph
+    LangGraph <--> ConvStore
+    ConvStore --> ConvDB
 
-    IngestEngine --> ColPali
-    IngestEngine --> RegistryDB
-    IngestEngine --> LocalStore
-    IngestEngine --> QdrantDB
-    IngestEngine --> GraphEngine
+    LangGraph --> ExtRouter
+    ExtRouter -->|Internal Retrieval| IntRouter
+    ExtRouter -->|Live Web Search| WebEngine
+    ExtRouter -->|Conversation Search| ConvStore
 
-    GraphEngine --> DoclingProc
-    GraphEngine --> GraphExtractor
-    GraphEngine --> Neo4jDB
+    IntRouter <--> DecisionCache
+    IntRouter -.->|On Cache Miss| LayaRouter
+    DecisionCache -.-> RedisManager
 
+    IntRouter -->|Graph / Visual / Hybrid| QueryEngine
     QueryEngine --> ColPali
     QueryEngine --> QdrantDB
     QueryEngine --> Neo4jDB
+    Neo4jDB -.->|Fallback on Empty Graph| QdrantDB
 
-    GenEngine --> QueryEngine
+    LangGraph --> GenEngine
     GenEngine --> QwenVL
     GenEngine --> LocalStore
-
-    RedisManager -.-> Idempotency
-    RedisManager -.-> ResultCache
 ```
 
 ### End-to-End Processing Sequence
@@ -169,39 +188,65 @@ sequenceDiagram
     participant Client
     participant API as FastAPI (api.py)
     participant Redis as Redis (:6380)
-    participant Ingest as ingest.py
+    participant Graph as LangGraph (rag_workflow.py)
+    participant ExtR as External Router (external_query_router.py)
+    participant IntR as Internal Router (query_router.py)
+    participant Laya as Laya Router Model
     participant Query as query.py
-    participant Gen as generate.py
+    participant Neo4j as Neo4j Graph (:7687)
     participant Qdrant as Qdrant (:6333)
+    participant Gen as generate.py
 
-    Note over Client,API: 1. Ingestion Phase
-    Client->>API: POST /ingest_document (Bearer JWT, PDF source)
-    API->>Redis: Check Idempotency-Key
-    API->>API: Queue async job in SQLite
-    API-->>Client: 202 Accepted (job_id)
-    API->>Ingest: Background worker triggers ingest
-    Ingest->>Ingest: SHA-256 PDF hash & PyMuPDF 150 DPI page rendering
-    Ingest->>Qdrant: Check cached vectors by page hash
-    Ingest->>Ingest: ColPali v1.3 NF4 embeds new pages (1024x128 multivector)
-    Ingest->>Qdrant: Upsert points with payload (is_current=True)
-    Ingest->>API: Update job status to completed
-
-    Note over Client,API: 2. Retrieval & Generation Phase
-    Client->>API: POST /generate (Bearer JWT, query, top_k)
+    Client->>API: POST /answer (Bearer JWT, query, conversation_id)
     API->>Redis: Check Idempotency & Answer Cache
-    API->>Gen: Execute query_and_generate()
-    Gen->>Query: retrieve(query, top_k)
-    Query->>Query: Embed query with ColPali
-    Query->>Qdrant: Late-interaction MaxSim search
-    Qdrant-->>Query: Scored top-k page candidates & image paths
-    Query-->>Gen: Return retrieved page metadata
-    Gen->>Gen: release_query_encoder() [GPU VRAM reclamation]
-    Gen->>Gen: Load Qwen3-VL-2B (4-bit NF4) & build multimodal prompt
-    Gen->>Gen: Synthesize visual context & produce cited answer
-    Gen->>Gen: unload_generator() [GPU VRAM reclamation]
-    Gen-->>API: Return answer, sources, and generation telemetry
-    API->>Redis: Cache answer & update idempotency
-    API-->>Client: 200 OK (answer, sources, latency metrics)
+    API->>Graph: Execute run_rag_pipeline(state)
+    Graph->>Graph: node_load_context (loads history & prior context)
+    Graph->>ExtR: node_route_query (evaluates sources)
+    ExtR-->>Graph: Decision (internal_retrieval, web_search, conversation_search)
+
+    alt Internal Retrieval Required
+        Graph->>IntR: Determine retrieval strategy
+        IntR->>Redis: Check Decision Cache (amg:router:decision:...)
+        alt Decision Cache Miss
+            IntR->>Laya: HTTP POST query & model params
+            Laya-->>IntR: Strategy ("graph" | "visual" | "hybrid")
+            IntR->>Redis: SETEX decision (ROUTER_DECISION_CACHE_TTL)
+        else Decision Cache Hit
+            Redis-->>IntR: Cached Strategy (bypass Laya HTTP call)
+        end
+        IntR-->>Graph: Selected Strategy
+
+        alt Strategy is "graph"
+            Graph->>Query: retrieve(query, enable_graph=True, enable_visual=False)
+            Query->>Neo4j: Query graph entities and claims
+            alt Neo4j returns usable results
+                Neo4j-->>Query: Entities & claim-backed pages
+            else Neo4j returns 0 usable results (Fallback Triggered)
+                Query->>Query: Auto-fallback: execute ColPali visual retrieval
+                Query->>Qdrant: Late-interaction MaxSim search
+                Qdrant-->>Query: Top-k visual document pages
+                Query-->>Query: Annotate fallback_metadata
+            end
+        else Strategy is "visual"
+            Graph->>Query: retrieve(query, enable_graph=False, enable_visual=True)
+            Query->>Qdrant: Late-interaction MaxSim search
+            Qdrant-->>Query: Top-k visual document pages
+        else Strategy is "hybrid"
+            Graph->>Query: retrieve(query, enable_graph=True, enable_visual=True)
+            Query->>Neo4j: Graph search
+            Query->>Qdrant: ColPali MaxSim search
+            Query-->>Query: Merge candidates by page identity
+        end
+        Query-->>Graph: Retrieved candidates & verified claims
+    end
+
+    Graph->>Graph: node_aggregate_evidence (format pages, claims, web text)
+    Graph->>Gen: node_generate_answer (Qwen3-VL-2B-Instruct)
+    Gen-->>Graph: Grounded answer & cited sources
+    Graph->>Graph: node_persist_turn (record turn in SQLite)
+    Graph-->>API: Return final response dictionary
+    API->>Redis: Store completed idempotency & cached response
+    API-->>Client: 200 OK (answer, sources, routing & retrieval metadata)
 ```
 
 ---
@@ -281,6 +326,163 @@ Or via CLI:
 python query.py --query "your query" --disable-graph
 ```
 The system will run strictly on the visual ColPali + Qdrant baseline.
+
+---
+
+## Query Routing & LangGraph Workflow
+
+AMG features a two-tier routing architecture orchestrating queries across conversation history, external web search, and internal multimodal/graph retrieval, followed by multi-step LangGraph state execution.
+
+### Internal Query Router (Laya Model & Redis Decision Caching)
+
+The Internal Query Router (`query_router.py`) determines the optimal retrieval strategy for internal document queries:
+- **`graph`**: Traverses Neo4j knowledge graph relationships, entity mentions, and factual claims.
+- **`visual`**: Uses ColPali multi-vector late-interaction `MAX_SIM` over rasterized document pages in Qdrant.
+- **`hybrid`**: Combines Neo4j graph search and ColPali visual retrieval, merging candidates by page identity.
+
+#### Laya Model Classification
+Strategy decisions are served by the Laya router model via an HTTP API (`LAYA_MODEL_END_POINT`). The router submits the normalized user query, model identifier (`LAYA_MODEL`), and checkpoint (`LAYA_CHECKPOINT`) to receive a validated classification.
+
+#### Redis Decision Caching
+To minimize external HTTP round trips and latency, routing decisions are cached in Redis:
+- **Deterministic Cache Key**: Formed as `amg:router:decision:<model>:<checkpoint>:<sha256(normalized_query)>`. Normalization trims whitespace and lowercases the input query.
+- **Decision Only**: Only the routing decision string (`graph`, `visual`, `hybrid`) is cached—retrieved documents and generation results are not cached in this key.
+- **Configurable TTL**: Governed by the `ROUTER_DECISION_CACHE_TTL` environment variable (defaults to `86400` seconds / 24 hours).
+- **Cache Hit**: Returns the cached decision immediately without invoking the Laya model HTTP endpoint.
+- **Cache Miss**: Invokes the Laya model API, validates the decision, and persists it in Redis using `SETEX`.
+- **Fault-Tolerant Fallback**: If Redis is offline or encounters connection failures, the router logs a warning and proceeds with direct Laya invocation (fails open).
+- **Error Protection**: Invalid model responses or unparseable payload errors are never cached.
+
+---
+
+### Graph-to-Qdrant Retrieval Fallback
+
+When the Internal Query Router or Laya selects the `graph` strategy, Neo4j is queried for relevant entities, relationships, and claim-backed pages. If the knowledge graph does not contain relevant entities or returns an empty result set:
+1. **Empty Detection**: The system evaluates the Neo4j graph retrieval output (`len(graph_pages) == 0`).
+2. **Automatic Fallback Execution**: Instead of returning an empty candidate set, AMG automatically triggers visual retrieval using ColPali multivectors and Qdrant.
+3. **Contract Preservation**: Fallback results conform to the standard `RetrievalResult` schema, allowing downstream evidence aggregation and generation to proceed seamlessly.
+4. **Audit Metadata**: The response includes explicit fallback annotations:
+   - `fallback_metadata.fallback_triggered = True`
+   - `fallback_metadata.fallback_reason = "graph_yielded_no_usable_results"`
+   - `fallback_metadata.fallback_strategy = "visual"`
+   - `final_strategy = "visual_fallback"`
+5. **No Overhead on Success**: If Graph retrieval succeeds with results, visual retrieval is not executed.
+6. **Strategy Isolation**: Existing `visual` and `hybrid` retrieval strategies remain completely unaffected.
+
+---
+
+### External Query Router (Source Selection)
+
+The External Query Router (`external_query_router.py`) inspects user queries in the context of recent conversation history to decide which information sources are needed:
+- **Conversation Context**: Utilizes recent turns for follow-up questions and coreference resolution.
+- **Historical Conversation Search**: Searches past user conversations stored in SQLite.
+- **Internal Retrieval**: Queries the document knowledge base using the Internal Query Router.
+- **External Web Search**: Retrieves live web information and snippets via the **Brave Search API** (`web_search.py`).
+
+The router generates rewritten search queries tailored to each selected source (`contextualized_query`, `internal_query`, `web_query`).
+
+> [!IMPORTANT]
+> **Tool Calling Exclusion**: Tool calling frameworks (such as `ToolRegistry`, tool execution frameworks, tool schemas, and ReAct agent loops) are **strictly excluded** from AMG. The External Query Router focuses exclusively on source selection and information retrieval.
+
+---
+
+### LangGraph Execution Lifecycle
+
+All query processing and answer generation in AMG are orchestrated through a compiled **LangGraph StateGraph** (`rag_workflow.py`):
+
+```mermaid
+flowchart TD
+    Start([User Query]) --> LoadContext["1. node_load_context<br/>(Load turns & prior evidence)"]
+    LoadContext --> RouteQuery["2. node_route_query<br/>(External Query Router)"]
+    
+    RouteQuery --> ClarifyCond{Clarification<br/>Required?}
+    ClarifyCond -- Yes --> ClarifyNode["3a. node_clarification<br/>(Prompt for missing info)"]
+    ClarifyCond -- No --> RetrieveSearch["3b. node_retrieval_and_search<br/>(Internal Router / Brave Web Search)"]
+
+    RetrieveSearch --> Aggregate["4. node_aggregate_evidence<br/>(Merge visual pages, claims, web text)"]
+    Aggregate --> Generate["5. node_generate_answer<br/>(Qwen3-VL-2B multimodal synthesis)"]
+
+    ClarifyNode --> PersistTurn["6. node_persist_turn<br/>(Store turn & metadata in SQLite)"]
+    Generate --> PersistTurn
+    PersistTurn --> EndState([Final Answer & Sources])
+```
+
+#### Node Lifecycle Responsibilities:
+1. **`node_load_context`**: Loads conversation turns, active tenant parameters, and prior turn retrieval context from the SQLite conversation store (`conversation_manager.py`).
+2. **`node_route_query`**: Evaluates sources using `ExternalQueryRouter`, generating contextualized queries.
+3. **`node_clarification`**: If the user query is ambiguous, halts retrieval and requests targeted user clarification.
+4. **`node_retrieval_and_search`**: Concurrently or sequentially dispatches to the Internal Query Router (Laya + Redis cache + Graph-to-Qdrant fallback) and/or Brave Search API.
+5. **`node_aggregate_evidence`**: Combines retrieved visual pages, verified knowledge graph claims, and web snippets into unified prompt context.
+6. **`node_generate_answer`**: Invokes `Qwen3-VL-2B-Instruct` (NF4 quantized) to produce a factual, cited response.
+7. **`node_persist_turn`**: Persists query, answer, source provenance, and telemetry to SQLite (`conversations.db`).
+
+---
+
+## Configuration & Environment Variables
+
+AMG is configured through environment variables (typically stored in `.env`). The tables below outline all primary configuration settings:
+
+### 1. Internal Query Router & Laya Model
+| Variable | Default | Description |
+|---|---|---|
+| `LAYA_ACCESS_TOKEN` | *(empty)* | Bearer authentication token for the Laya model routing API |
+| `LAYA_MODEL_END_POINT` | `https://api.laya.ai/v1/chat/completions` | HTTP endpoint URL for Laya router classification |
+| `LAYA_MODEL` | `laya-router-v1` | Model identifier used for Laya routing decisions |
+| `LAYA_CHECKPOINT` | `default` | Model checkpoint / fine-tuning version tag |
+| `ROUTER_DECISION_CACHE_TTL` | `86400` | Redis cache TTL (in seconds) for Laya routing decisions (24 hours) |
+
+### 2. Redis Coordination & Caching
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_HOST` | `127.0.0.1` | Redis host or container hostname |
+| `REDIS_PORT` | `6380` | Redis listening port (default `6380` for host; `6379` in container) |
+| `REDIS_DB` | `0` | Redis logical database index |
+| `REDIS_PASSWORD` | *(empty)* | Redis authentication password (if enabled) |
+| `REDIS_CONNECT_TIMEOUT` | `2.0` | Socket connection timeout in seconds |
+| `REDIS_CACHE_TTL` | `600` | Answer and retrieval result cache TTL (10 minutes) |
+| `REDIS_JOB_TTL` | `259200` | Async job state cache TTL (3 days) |
+| `REDIS_IDEMPOTENCY_TTL` | `86400` | Completed idempotency record TTL (24 hours) |
+| `REDIS_IDEMPOTENCY_RESERVATION_TTL` | `120` | Pending idempotency reservation window (2 minutes) |
+
+### 3. Neo4j Knowledge Graph & Docling
+| Variable | Default | Description |
+|---|---|---|
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt protocol connection URI |
+| `NEO4J_USERNAME` | `neo4j` | Neo4j username |
+| `NEO4J_PASSWORD` | `amg_graph_pass` | Neo4j password |
+| `NEO4J_DATABASE` | `neo4j` | Neo4j target database name |
+| `DOCLING_ENABLED` | `true` | Enable Docling document layout and structural table extraction |
+| `NEO4J_ENABLED` | `true` | Enable Neo4j graph storage and Cypher query execution |
+| `GRAPH_RETRIEVAL_ENABLED` | `true` | Enable Graph retrieval stage during query processing |
+
+### 4. Qdrant Vector Database
+| Variable | Default | Description |
+|---|---|---|
+| `QDRANT_URL` | `http://localhost:6333` | Base REST API URL for Qdrant vector database |
+| `QDRANT_COLLECTION` | `personal_collection` | Qdrant collection name for document multivectors |
+| `COLPALI_VECTOR_SIZE` | `128` | Multi-vector token embedding dimension |
+
+### 5. ColPali Ingestion & Retrieval Model
+| Variable | Default | Description |
+|---|---|---|
+| `COLPALI_MODEL` | `vidore/colpali-v1.3-merged` | Hugging Face model identifier for ColPali |
+| `COLPALI_MODEL_REVISION` | `main` | Hugging Face git branch/tag revision |
+| `COLPALI_QUANTIZATION` | `bitsandbytes_4bit_nf4` | 4-bit NormalFloat quantization for ColPali VRAM efficiency |
+
+### 6. Multimodal Generation Model
+| Variable | Default | Description |
+|---|---|---|
+| `GENERATE_MODEL_ID` | `Qwen/Qwen3-VL-2B-Instruct` | Vision-language generator model repository ID |
+| `GENERATE_MAX_NEW_TOKENS` | `256` | Maximum output generation token count |
+| `GENERATE_QUANTIZATION` | `bitsandbytes_4bit_nf4` | 4-bit NF4 quantization for generation |
+| `GENERATE_DTYPE` | `bfloat16` | Compute dtype (`bfloat16` or `float16`) |
+
+### 7. External Web Search & Reranking APIs
+| Variable | Default | Description |
+|---|---|---|
+| `BRAVE_API_KEY` | *(empty)* | Brave Search API subscription key for live web search |
+| `OPENROUTER_API_KEY` | *(empty)* | OpenRouter API key for graph claim extraction |
+| `JINA_API_KEY` | *(empty)* | Jina AI API key for `jina-reranker-m0` cross-modal reranking |
 
 ---
 
@@ -714,87 +916,26 @@ curl -X GET http://localhost:8000/ingest_document/ingest_20261022104500_a1b2c3d4
 
 ---
 
-### 3. Document Retrieval (`POST /query`)
+### 3. Multimodal Answer Generation (`POST /answer` - Canonical)
 
-Submits an asynchronous multi-vector retrieval job using ColPali late-interaction `MAX_SIM`.
+`POST /answer` is the canonical, production-grade endpoint for multimodal question answering in AMG. It executes the compiled LangGraph workflow: loading conversation history, evaluating information sources via the External Query Router, selecting retrieval strategies via the Internal Query Router (with Redis decision caching and Graph-to-Qdrant fallback), aggregating evidence, and producing grounded answers using `Qwen3-VL-2B-Instruct`.
 
-#### A. Submit Query
+> [!NOTE]
+> **Backward Compatibility**: `POST /generate`, `POST /generate/stream`, and `GET /generate/{job_id}` remain fully functional as backward-compatible aliases pointing to the identical underlying engine.
+
+#### A. Submit Answering Request
 
 ```bash
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8000/answer \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "usr_94b5f889",
-    "organization": "AMG-Research",
-    "role": "researcher",
-    "query": "What was the operating cash flow in Q3?",
-    "document_ids": [],
-    "version_ids": [],
-    "recursive_search": false,
-    "top_k": 3
-  }'
-```
-
-**Response (`202 Accepted`)**:
-```json
-{
-  "job_id": "query_20261022104600_b2c3d4e5",
-  "status": "accepted",
-  "message": "Query job accepted."
-}
-```
-
-#### B. Poll Query Results (`GET /query/{query_job_id}`)
-
-```bash
-curl -X GET http://localhost:8000/query/query_20261022104600_b2c3d4e5 \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-**Response (`200 OK` - Completed)**:
-```json
-{
-  "job_id": "query_20261022104600_b2c3d4e5",
-  "status": "completed",
-  "result": {
-    "query": "What was the operating cash flow in Q3?",
-    "retrieval_scope": "latest_versions",
-    "results_count": 3,
-    "results": [
-      {
-        "rank": 1,
-        "score": 0.9412,
-        "document_id": "doc_e3f28d8b-821c-4b53-9c02-76326bb178d2",
-        "version_id": "ver_01f92e3a-0e92-411a-b328-9842bf27ce52",
-        "version_number": 1,
-        "filename": "financial_report_2025.pdf",
-        "page_number": 8,
-        "page_image_path": "data/pages/doc_e3f28d8b/ver_01f92e3a/page_8.png"
-      }
-    ]
-  }
-}
-```
-
----
-
-### 4. Multimodal Answer Generation (`POST /generate`)
-
-Executes visual retrieval followed by `Qwen3-VL-2B-Instruct` multimodal inference. Returns the synthesized answer, ranked sources, and execution telemetry. Supports atomic idempotency through `Idempotency-Key`.
-
-#### A. Submit Generation Request
-
-```bash
-curl -X POST http://localhost:8000/generate \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: gen-req-unique-987" \
+  -H "Idempotency-Key: ans-req-unique-987" \
   -d '{
     "user_id": "usr_94b5f889",
     "organization": "AMG-Research",
     "role": "researcher",
     "query": "What was the operating cash flow in Q3 according to the financial statement?",
+    "conversation_id": "conv_20261112100000_a1b2c3d4",
     "document_ids": [],
     "version_ids": [],
     "recursive_search": false,
@@ -808,6 +949,7 @@ curl -X POST http://localhost:8000/generate \
 ```json
 {
   "answer": "According to the Statement of Cash Flows (Source S1, Page 8), the operating cash flow in Q3 was $4.18 billion, representing a 14% year-over-year increase driven primarily by strength in cloud enterprise revenue.",
+  "conversation_id": "conv_20261112100000_a1b2c3d4",
   "sources": [
     {
       "source_id": "S1",
@@ -849,31 +991,20 @@ curl -X POST http://localhost:8000/generate \
   }
 }
 ```
-    "context_pages": 3,
-    "images_used": 3,
-    "min_pixels": 262144,
-    "max_pixels": 524288,
-    "max_new_tokens": 256,
-    "duration_ms": 3412.85,
-    "retrieval_scope": "latest_versions",
-    "retrieval_result_count": 3
-  }
-}
-```
 
-#### B. Fetch Historical Generation Job (`GET /generate/{generate_job_id}`)
+#### B. Fetch Historical Answer Job (`GET /answer/{generate_job_id}`)
 
 ```bash
-curl -X GET http://localhost:8000/generate/gen_20261022104800_c3d4e5f6 \
+curl -X GET http://localhost:8000/answer/gen_20261022104800_c3d4e5f6 \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-#### C. Real-Time Streaming Generation (`POST /generate/stream`)
+#### C. Real-Time Streaming Answering (`POST /answer/stream`)
 
 Streams tokens incrementally via Server-Sent Events (SSE) using Hugging Face `TextIteratorStreamer` and FastAPI `StreamingResponse`. Reduces Time-To-First-Token (TTFT) from ~10s to <1s.
 
 ```bash
-curl -N -X POST http://localhost:8000/generate/stream \
+curl -N -X POST http://localhost:8000/answer/stream \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
@@ -916,7 +1047,7 @@ data: {
     }
   ],
   "generation": {
-    "model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "model_id": "Qwen/Qwen3-VL-2B-Instruct",
     "duration_ms": 3120.4,
     "ttft_ms": 780.2
   },
@@ -927,16 +1058,16 @@ data: {
 
 ---
 
-### 5. Multi-Turn Conversation Management (`conversation_id`)
+### 4. Multi-Turn Conversation Management (`conversation_id`)
 
 AMG automatically tracks and persists conversational context across follow-up queries. All questions, grounded answers, retrieved sources, and generation metadata are recorded under a unique `conversation_id`.
 
-- If `conversation_id` is omitted in `POST /generate` or `POST /generate/stream`, a new conversation ID (e.g. `conv_20261112100000_a1b2c3d4`) is automatically assigned and returned.
+- If `conversation_id` is omitted in `POST /answer` or `POST /answer/stream`, a new conversation ID (e.g. `conv_20261112100000_a1b2c3d4`) is automatically assigned and returned.
 - If an existing `conversation_id` is provided in subsequent requests, previous turns are loaded and injected into Qwen's context for coreference resolution and follow-up answering.
 
-#### A. Follow-up Generation Request
+#### A. Follow-up Answering Request
 ```bash
-curl -X POST http://localhost:8000/generate \
+curl -X POST http://localhost:8000/answer \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -969,7 +1100,7 @@ curl -X DELETE http://localhost:8000/conversations/conv_20261112100000_a1b2c3d4 
 
 ---
 
-### 6. Document Listing & Health Inspection
+### 5. Document Listing & Health Inspection
 
 #### List Ingested Documents & Versions (`GET /list_documents`)
 
@@ -1009,6 +1140,16 @@ curl -X GET http://localhost:8000/health
   "version": "1.0.0"
 }
 ```
+
+---
+
+### 6. Decommissioned Endpoints Notice (`POST /query`)
+
+> [!WARNING]
+> The endpoints `POST /query` and `GET /query/{query_job_id}` have been **permanently decommissioned and removed** from the API.
+> - Retrieval, source routing, and multimodal generation have been unified into `POST /answer` (and its streaming counterpart `POST /answer/stream`).
+> - Requesting `/query` will return a standard `404 Not Found` response.
+> - If your client previously called `/query`, update your integration to target `POST /answer`.
 
 ---
 

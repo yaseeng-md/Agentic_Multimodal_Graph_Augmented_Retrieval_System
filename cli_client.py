@@ -13,10 +13,10 @@ Features:
       5.  GET  /list_documents
       6.  POST /ingest_document (with auto-polling option & PDF selector)
       7.  GET  /ingest_document/{job_id}
-      8.  POST /query (with auto-polling option)
-      9.  GET  /query/{query_job_id}
-      10. POST /generate (with auto-polling option)
-      11. GET  /generate/{generate_job_id}
+      8.  POST /answer (with auto-polling option)
+      9.  GET  /answer/{job_id}
+      10. POST /answer/stream (Real-Time SSE Streaming Generation)
+      11. GET  /conversations
       12. Automated Smoke Test (health -> register/login -> me -> list docs)
       13. Session / Token Management (inspect, switch, logout, base URL)
       14. Custom Raw Request (any HTTP method, path, and payload)
@@ -731,70 +731,20 @@ def handle_poll_ingest(debugger: ApiDebugger) -> None:
 
 
 def handle_query(debugger: ApiDebugger) -> None:
-    """POST /query"""
-    console.print("\n[bold cyan]🔎 Mode 8: Multi-Vector / Graph Query Retrieval (POST /query)[/bold cyan]")
-
-    user_info = debugger.session.user
-    user_id = Prompt.ask("User ID", default=user_info.get("user_id", "default_user"))
-    org = Prompt.ask("Organization", default=user_info.get("organization_name", "Acme Corp"))
-    role = Prompt.ask("Role", default=user_info.get("role", "engineer"))
-
-    query = Prompt.ask("Search Query", default="What are the main technical conclusions and results?")
-    top_k = int(Prompt.ask("Top K results", default="5"))
-    recursive = Confirm.ask("Recursive search across all document versions?", default=False)
-    enable_rerank = Confirm.ask("Enable multimodal Jina reranker?", default=False)
-    enable_graph = Confirm.ask("Enable Knowledge Graph claims retrieval?", default=True)
-
-    doc_ids_raw = Prompt.ask("Filter by Document IDs (comma-separated, or leave blank)", default="")
-    doc_ids = [d.strip() for d in doc_ids_raw.split(",") if d.strip()]
-
-    version_ids_raw = Prompt.ask("Filter by Version IDs (comma-separated, or leave blank)", default="")
-    version_ids = [v.strip() for v in version_ids_raw.split(",") if v.strip()]
-
-    payload: dict[str, Any] = {
-        "user_id": user_id,
-        "organization": org,
-        "role": role,
-        "query": query,
-        "document_ids": doc_ids,
-        "version_ids": version_ids,
-        "recursive_search": recursive,
-        "top_k": top_k,
-        "enable_rerank": enable_rerank,
-        "rerank_threshold": 0.75,
-        "retrieval_top_k": 20,
-        "enable_graph": enable_graph,
-    }
-
-    resp = debugger.send_request("POST", "/query", json_body=payload)
-    if resp is not None and resp.status_code in {200, 202}:
-        data = resp.json()
-        job_id = data.get("job_id")
-        if job_id:
-            debugger.session.record_job("query", job_id)
-            if Confirm.ask(f"Wait and poll query job [bold]{job_id}[/bold] until complete?", default=True):
-                poll_job(debugger, "query", job_id)
+    """POST /answer (formerly /query - routed to canonical answer pipeline)"""
+    console.print("\n[bold yellow]Notice: POST /query has been decommissioned. Directing to canonical POST /answer pipeline.[/bold yellow]")
+    handle_generate(debugger)
 
 
 def handle_poll_query(debugger: ApiDebugger) -> None:
-    """GET /query/{query_job_id}"""
-    console.print("\n[bold cyan]🔍 Mode 9: Poll Query Retrieval Job[/bold cyan]")
-    default_job_id = debugger.session.last_jobs.get("query", "")
-    job_id = Prompt.ask("Query Job ID", default=default_job_id)
-    if not job_id:
-        console.print("[red]Job ID cannot be empty.[/red]")
-        return
-    debugger.session.record_job("query", job_id)
-
-    if Confirm.ask("Poll continuously until complete/failed?", default=True):
-        poll_job(debugger, "query", job_id)
-    else:
-        debugger.send_request("GET", f"/query/{job_id}")
+    """GET /answer/{id} (formerly /query/{id})"""
+    console.print("\n[bold yellow]Notice: GET /query/{id} has been decommissioned. Directing to GET /answer/{id}.[/bold yellow]")
+    handle_poll_generate(debugger)
 
 
 def handle_generate(debugger: ApiDebugger) -> None:
-    """POST /generate"""
-    console.print("\n[bold cyan]🧠 Mode 10: Multimodal Answer Generation (POST /generate)[/bold cyan]")
+    """POST /answer (Multimodal Answer Generation)"""
+    console.print("\n[bold cyan]🧠 Multimodal Answer Generation (POST /answer)[/bold cyan]")
 
     user_info = debugger.session.user
     user_id = Prompt.ask("User ID", default=user_info.get("user_id", "default_user"))
@@ -833,7 +783,7 @@ def handle_generate(debugger: ApiDebugger) -> None:
     if cid_prompt:
         payload["conversation_id"] = cid_prompt
 
-    resp = debugger.send_request("POST", "/generate", json_body=payload, custom_headers=custom_headers)
+    resp = debugger.send_request("POST", "/answer", json_body=payload, custom_headers=custom_headers)
     if resp is not None and resp.status_code in {200, 202}:
         data = resp.json()
         cid = data.get("conversation_id")
@@ -864,12 +814,12 @@ def handle_poll_generate(debugger: ApiDebugger) -> None:
     if Confirm.ask("Poll continuously until complete/failed?", default=True):
         poll_job(debugger, "generate", job_id)
     else:
-        debugger.send_request("GET", f"/generate/{job_id}")
+        debugger.send_request("GET", f"/answer/{job_id}")
 
 
 def handle_generate_stream(debugger: ApiDebugger) -> None:
-    """POST /generate/stream (Real-Time Server-Sent Events Streaming)"""
-    console.print("\n[bold cyan]⚡ Mode 12: Real-Time Streaming Generation (POST /generate/stream)[/bold cyan]")
+    """POST /answer/stream (Real-Time Server-Sent Events Streaming)"""
+    console.print("\n[bold cyan]⚡ Real-Time Streaming Generation (POST /answer/stream)[/bold cyan]")
 
     user_info = debugger.session.user
     user_id = Prompt.ask("User ID", default=user_info.get("user_id", "default_user"))
@@ -903,7 +853,7 @@ def handle_generate_stream(debugger: ApiDebugger) -> None:
     if cid_prompt:
         payload["conversation_id"] = cid_prompt
 
-    url = f"{debugger.session.base_url}/generate/stream"
+    url = f"{debugger.session.base_url}/answer/stream"
     headers = {
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
@@ -1191,7 +1141,7 @@ def handle_custom_request(debugger: ApiDebugger) -> None:
     console.print("\n[bold cyan]🔧 Mode 14: Custom Raw Request[/bold cyan]")
 
     method = Prompt.ask("HTTP Method", choices=["GET", "POST", "PUT", "DELETE", "PATCH"], default="GET")
-    path = Prompt.ask("Endpoint Path (e.g. /health, /query/my_id)", default="/health")
+    path = Prompt.ask("Endpoint Path (e.g. /health, /answer/my_id)", default="/health")
 
     include_auth = Confirm.ask("Include Bearer Authorization token?", default=debugger.session.auto_auth)
 
@@ -1255,15 +1205,13 @@ def interactive_loop(session: SessionManager) -> None:
         console.print("  [cyan]5[/cyan].  GET  /list_documents           [dim]Registered Documents & Versions[/dim]")
         console.print("  [cyan]6[/cyan].  POST /ingest_document          [dim]Submit Document Ingestion Job[/dim]")
         console.print("  [cyan]7[/cyan].  GET  /ingest_document/{job_id} [dim]Poll Document Ingestion Status[/dim]")
-        console.print("  [cyan]8[/cyan].  POST /query                    [dim]Multi-Vector / Graph Retrieval[/dim]")
-        console.print("  [cyan]9[/cyan].  GET  /query/{query_job_id}     [dim]Poll Query Job Retrieval Results[/dim]")
-        console.print("  [cyan]10[/cyan]. POST /generate                 [dim]Multimodal Answer Generation (Async Job)[/dim]")
-        console.print("  [cyan]11[/cyan]. GET  /generate/{job_id}         [dim]Poll Generation Job Results[/dim]")
-        console.print("  [green]12[/green]. POST /generate/stream          [dim]Real-Time SSE Streaming Generation[/dim]")
-        console.print("  [cyan]13[/cyan]. GET  /conversations            [dim]Conversation History & Turns[/dim]")
-        console.print("  [magenta]14[/magenta]. Automated Smoke Test Suite       [dim]Verify non-destructive endpoints in order[/dim]")
-        console.print("  [yellow]15[/yellow]. Session / Auth Management        [dim]Inspect token, switch user, change URL[/dim]")
-        console.print("  [blue]16[/blue]. Custom Raw HTTP Request        [dim]Arbitrary method, endpoint, and payload[/dim]")
+        console.print("  [cyan]8[/cyan].  POST /answer                   [dim]Multimodal Answer Generation (Canonical)[/dim]")
+        console.print("  [cyan]9[/cyan].  GET  /answer/{job_id}          [dim]Poll Answer Job Results[/dim]")
+        console.print("  [green]10[/green]. POST /answer/stream            [dim]Real-Time SSE Streaming Generation[/dim]")
+        console.print("  [cyan]11[/cyan]. GET  /conversations            [dim]Conversation History & Turns[/dim]")
+        console.print("  [magenta]12[/magenta]. Automated Smoke Test Suite       [dim]Verify non-destructive endpoints in order[/dim]")
+        console.print("  [yellow]13[/yellow]. Session / Auth Management        [dim]Inspect token, switch user, change URL[/dim]")
+        console.print("  [blue]14[/blue]. Custom Raw HTTP Request        [dim]Arbitrary method, endpoint, and payload[/dim]")
         console.print("  [red]0[/red].  Exit")
 
         choice = Prompt.ask("\nEnter Mode #", default="1")
@@ -1285,22 +1233,18 @@ def interactive_loop(session: SessionManager) -> None:
             elif choice == "7":
                 handle_poll_ingest(debugger)
             elif choice == "8":
-                handle_query(debugger)
-            elif choice == "9":
-                handle_poll_query(debugger)
-            elif choice == "10":
                 handle_generate(debugger)
-            elif choice == "11":
+            elif choice == "9":
                 handle_poll_generate(debugger)
-            elif choice == "12":
+            elif choice == "10":
                 handle_generate_stream(debugger)
-            elif choice == "13":
+            elif choice == "11":
                 handle_conversations(debugger)
-            elif choice == "14":
+            elif choice == "12":
                 handle_smoke_test(debugger)
-            elif choice == "15":
+            elif choice == "13":
                 handle_session_settings(debugger)
-            elif choice == "16":
+            elif choice == "14":
                 handle_custom_request(debugger)
             elif choice in {"0", "q", "exit", "quit"}:
                 console.print("[cyan]Goodbye![/cyan]")
@@ -1352,7 +1296,7 @@ def main() -> None:
     parser.add_argument(
         "--poll",
         action="store_true",
-        help="Automatically poll jobs to completion when submitting ingest/query/generate",
+        help="Automatically poll jobs to completion when submitting ingest/answer",
     )
     parser.add_argument(
         "--smoke-test",
@@ -1388,7 +1332,7 @@ def main() -> None:
             handle_list_documents(debugger)
         elif args.mode == "smoke_test":
             handle_smoke_test(debugger)
-        elif args.mode == "query":
+        elif args.mode in ("query", "answer"):
             q_text = args.query or "What are the key technical findings in the document?"
             payload = {
                 "user_id": session.user.get("user_id", "default_user"),
@@ -1404,9 +1348,9 @@ def main() -> None:
                 "retrieval_top_k": 20,
                 "enable_graph": True,
             }
-            resp = debugger.send_request("POST", "/query", json_body=payload)
+            resp = debugger.send_request("POST", "/answer", json_body=payload)
             if args.poll and resp is not None and resp.status_code in {200, 202}:
-                poll_job(debugger, "query", resp.json().get("job_id"))
+                poll_job(debugger, "generate", resp.json().get("job_id"))
         elif args.mode == "generate":
             q_text = args.query or "Summarize the technical contents of the document."
             payload = {

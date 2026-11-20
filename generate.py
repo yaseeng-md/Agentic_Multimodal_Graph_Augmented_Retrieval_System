@@ -443,6 +443,7 @@ def _build_messages(
     query: str,
     pages: Sequence[dict[str, Any]],
     conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
+    web_evidence: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     history_block = ""
     if conversation_history:
@@ -457,23 +458,41 @@ def _build_messages(
         if formatted_history:
             history_block = f"\n\nPRIOR CONVERSATION HISTORY:\n{formatted_history}\n"
 
-    system_rules = (
-        "You are the answer-generation stage of a multimodal RAG system.\n\n"
-        "Answer the user's question ONLY from the retrieved document pages below"
-        + (" and the prior conversation history if relevant.\n\n" if history_block else ".\n\n")
-        + "Rules:\n"
-        "1. Do not use outside knowledge.\n"
-        "2. Do not invent facts, numbers, page numbers, document IDs, versions, or quotes.\n"
-        "3. Use extracted text for textual evidence.\n"
-        "4. Use the page image when visual/layout information is relevant.\n"
-        "5. If evidence is insufficient, explicitly say so.\n"
-        "6. Keep the answer concise.\n"
-        "7. [S1], [S2], etc. refer to the supplied retrieved pages.\n"
-    )
+    if pages:
+        system_rules = (
+            "You are the answer-generation stage of a multimodal RAG system.\n\n"
+            "Answer the user's question primarily from the retrieved document pages below"
+            + (" and the external web search evidence" if web_evidence else "")
+            + (" and the prior conversation history if relevant.\n\n" if history_block else ".\n\n")
+            + "Rules:\n"
+            "1. Ground your answers strictly in the provided evidence.\n"
+            "2. Do not invent facts, numbers, page numbers, document IDs, versions, or quotes.\n"
+            "3. Use extracted text for textual evidence.\n"
+            "4. Use the page image when visual/layout information is relevant.\n"
+            "5. If evidence is insufficient, explicitly say so.\n"
+            "6. Keep the answer concise and well-structured.\n"
+            "7. [S1], [S2], etc. refer to the supplied retrieved pages.\n"
+        )
+    elif web_evidence:
+        system_rules = (
+            "You are the answer-generation stage of an AI assistant.\n\n"
+            "Answer the user's question using the external web search evidence below"
+            + (" and the prior conversation history if relevant.\n\n" if history_block else ".\n\n")
+            + "Rules:\n"
+            "1. Ground your answer in the provided web search evidence.\n"
+            "2. Cite source URLs or titles where appropriate.\n"
+            "3. Keep the answer concise and factual.\n"
+        )
+    else:
+        system_rules = (
+            "You are a helpful AI assistant.\n\n"
+            "Answer the user's question accurately, concisely, and helpfully"
+            + (" using the prior conversation history if relevant.\n\n" if history_block else ".\n\n")
+        )
 
     if history_block:
         system_rules += (
-            "8. If the current question is a follow-up referring to earlier context (e.g. pronouns like 'it', 'they', 'that', or comparative questions), use the conversation history to resolve references while strictly grounding answers in the supplied retrieved sources.\n"
+            "8. If the current question is a follow-up referring to earlier context (e.g. pronouns like 'it', 'they', 'that', or comparative questions), use the conversation history to resolve references while strictly grounding answers in the supplied sources.\n"
         )
 
     user_question_text = (
@@ -488,6 +507,14 @@ def _build_messages(
             "text": f"{system_rules}\n{user_question_text}",
         }
     ]
+
+    if web_evidence:
+        content.append(
+            {
+                "type": "text",
+                "text": f"\n\n{web_evidence}\n",
+            }
+        )
 
     for index, page in enumerate(pages, start=1):
         source_id = f"S{index}"
@@ -715,29 +742,29 @@ class QwenGenerator:
     def generate_from_retrieval(
         self,
         query: str,
-        retrieval_result: dict[str, Any],
+        retrieval_result: Optional[dict[str, Any]] = None,
         conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
         conversation_id: Optional[str] = None,
+        web_evidence: Optional[str] = None,
+        allow_empty_pages: bool = False,
     ) -> GenerationResponse:
         if not query or not query.strip():
             raise ValueError(
                 "query must be a non-empty string"
             )
 
-        pages = _build_generation_pages(
-            retrieval_result
-        )
+        pages = _build_generation_pages(retrieval_result) if retrieval_result else []
 
-        if not pages:
+        if not pages and not web_evidence and not allow_empty_pages:
             raise RuntimeError(
-                "No usable retrieved pages were available "
-                "for generation."
+                "No usable retrieved pages were available for generation."
             )
 
         messages = _build_messages(
             query=query,
             pages=pages,
             conversation_history=conversation_history,
+            web_evidence=web_evidence,
         )
 
         started = time.perf_counter()
@@ -895,29 +922,29 @@ class QwenGenerator:
     def stream_from_retrieval(
         self,
         query: str,
-        retrieval_result: dict[str, Any],
+        retrieval_result: Optional[dict[str, Any]] = None,
         conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
         conversation_id: Optional[str] = None,
+        web_evidence: Optional[str] = None,
+        allow_empty_pages: bool = False,
     ) -> Iterator[dict[str, Any]]:
         if not query or not query.strip():
             raise ValueError(
                 "query must be a non-empty string"
             )
 
-        pages = _build_generation_pages(
-            retrieval_result
-        )
+        pages = _build_generation_pages(retrieval_result) if retrieval_result else []
 
-        if not pages:
+        if not pages and not web_evidence and not allow_empty_pages:
             raise RuntimeError(
-                "No usable retrieved pages were available "
-                "for generation."
+                "No usable retrieved pages were available for generation."
             )
 
         messages = _build_messages(
             query=query,
             pages=pages,
             conversation_history=conversation_history,
+            web_evidence=web_evidence,
         )
 
         started = time.perf_counter()
@@ -1104,6 +1131,71 @@ class QwenGenerator:
                 if GENERATOR_RELEASE_AFTER_GENERATION:
                     self._release_model()
 
+    def generate_structured_text(
+        self,
+        messages: list[dict[str, Any]],
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> tuple[str, float]:
+        """
+        Execute short structured text generation (e.g. for query routing).
+        Shares the exact same locally loaded model, tokenizer, and lock.
+        """
+        started = time.perf_counter()
+        with self._generation_lock:
+            self._load_model()
+            assert self.model is not None
+            assert self.processor is not None
+
+            text = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            inputs = self.processor(
+                text=text,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.model.device)
+
+            generation_kwargs: dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "use_cache": True,
+                "do_sample": False if temperature <= 0.0 else True,
+            }
+            if temperature > 0.0:
+                generation_kwargs["temperature"] = temperature
+                generation_kwargs["top_p"] = 0.9
+
+            with torch.inference_mode():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    **generation_kwargs,
+                )
+
+            trimmed_ids = [
+                output_ids[len(input_ids):]
+                for input_ids, output_ids in zip(
+                    inputs.input_ids,
+                    generated_ids,
+                )
+            ]
+            output_text = self.processor.batch_decode(
+                trimmed_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+
+            del inputs
+            del generated_ids
+            del trimmed_ids
+
+            answer = output_text[0].strip() if output_text else ""
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            return answer, duration_ms
+
 
 # ===========================================================================
 # Process-local generator
@@ -1245,9 +1337,11 @@ def query_and_generate(
 
 def generate_answer(
     query: str,
-    retrieval_result: dict[str, Any],
+    retrieval_result: Optional[dict[str, Any]] = None,
     conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
     conversation_id: Optional[str] = None,
+    web_evidence: Optional[str] = None,
+    allow_empty_pages: bool = False,
 ) -> dict[str, Any]:
     """
     Generate from an already completed retrieve() call.
@@ -1266,6 +1360,8 @@ def generate_answer(
         retrieval_result=retrieval_result,
         conversation_history=conversation_history,
         conversation_id=conversation_id,
+        web_evidence=web_evidence,
+        allow_empty_pages=allow_empty_pages,
     )
 
     return asdict(result)
@@ -1273,9 +1369,11 @@ def generate_answer(
 
 def generate_answer_stream(
     query: str,
-    retrieval_result: dict[str, Any],
+    retrieval_result: Optional[dict[str, Any]] = None,
     conversation_history: Optional[Sequence[dict[str, Any]] | str] = None,
     conversation_id: Optional[str] = None,
+    web_evidence: Optional[str] = None,
+    allow_empty_pages: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """
     Stream tokens from an already completed retrieve() call.
@@ -1293,6 +1391,8 @@ def generate_answer_stream(
         retrieval_result=retrieval_result,
         conversation_history=conversation_history,
         conversation_id=conversation_id,
+        web_evidence=web_evidence,
+        allow_empty_pages=allow_empty_pages,
     )
 
 

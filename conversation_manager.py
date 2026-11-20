@@ -116,6 +116,9 @@ def _record_from_dict(d: dict[str, Any]) -> ConversationRecord:
             answer=t["answer"],
             sources=t.get("sources", []),
             generation_metadata=t.get("generation_metadata", {}),
+            routing_metadata=t.get("routing_metadata", {}),
+            retrieval_metadata=t.get("retrieval_metadata", {}),
+            web_metadata=t.get("web_metadata", {}),
             created_at=t["created_at"],
         )
         for t in d.get("turns", [])
@@ -143,6 +146,17 @@ class ConversationTurn:
     sources: list[dict[str, Any]]
     generation_metadata: dict[str, Any]
     created_at: str
+    routing_metadata: dict[str, Any] = None
+    retrieval_metadata: dict[str, Any] = None
+    web_metadata: dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.routing_metadata is None:
+            self.routing_metadata = {}
+        if self.retrieval_metadata is None:
+            self.retrieval_metadata = {}
+        if self.web_metadata is None:
+            self.web_metadata = {}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +168,9 @@ class ConversationTurn:
             "answer": self.answer,
             "sources": self.sources,
             "generation_metadata": self.generation_metadata,
+            "routing_metadata": self.routing_metadata,
+            "retrieval_metadata": self.retrieval_metadata,
+            "web_metadata": self.web_metadata,
             "created_at": self.created_at,
         }
 
@@ -231,6 +248,9 @@ class ConversationStore:
                     answer TEXT NOT NULL,
                     sources TEXT NOT NULL DEFAULT '[]',
                     generation_metadata TEXT NOT NULL DEFAULT '{}',
+                    routing_metadata TEXT NOT NULL DEFAULT '{}',
+                    retrieval_metadata TEXT NOT NULL DEFAULT '{}',
+                    web_metadata TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (conversation_id)
                         REFERENCES conversations(conversation_id)
@@ -238,6 +258,23 @@ class ConversationStore:
                 )
                 """
             )
+            # Automatic schema migration for existing SQLite databases
+            existing_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(conversation_turns)").fetchall()
+            }
+            if "routing_metadata" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN routing_metadata TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "retrieval_metadata" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN retrieval_metadata TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "web_metadata" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN web_metadata TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_conv_turns_cid
@@ -330,6 +367,9 @@ class ConversationStore:
         answer: str,
         sources: Optional[list[dict[str, Any]]] = None,
         generation_metadata: Optional[dict[str, Any]] = None,
+        routing_metadata: Optional[dict[str, Any]] = None,
+        retrieval_metadata: Optional[dict[str, Any]] = None,
+        web_metadata: Optional[dict[str, Any]] = None,
     ) -> ConversationTurn:
         """
         Add a Q&A interaction turn to the conversation.
@@ -339,6 +379,9 @@ class ConversationStore:
         now = utc_now()
         sources_json = json.dumps(sources or [])
         gen_meta_json = json.dumps(generation_metadata or {})
+        routing_meta_json = json.dumps(routing_metadata or {})
+        retrieval_meta_json = json.dumps(retrieval_metadata or {})
+        web_meta_json = json.dumps(web_metadata or {})
 
         # Ensure conversation exists
         self.get_or_create_conversation(cid, user_id=user_id, organization=organization)
@@ -347,8 +390,9 @@ class ConversationStore:
             cursor = conn.execute(
                 """
                 INSERT INTO conversation_turns (
-                    conversation_id, user_id, organization, query, answer, sources, generation_metadata, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    conversation_id, user_id, organization, query, answer, sources,
+                    generation_metadata, routing_metadata, retrieval_metadata, web_metadata, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cid,
@@ -358,6 +402,9 @@ class ConversationStore:
                     answer.strip(),
                     sources_json,
                     gen_meta_json,
+                    routing_meta_json,
+                    retrieval_meta_json,
+                    web_meta_json,
                     now,
                 ),
             )
@@ -401,6 +448,9 @@ class ConversationStore:
             answer=answer.strip(),
             sources=sources or [],
             generation_metadata=generation_metadata or {},
+            routing_metadata=routing_metadata or {},
+            retrieval_metadata=retrieval_metadata or {},
+            web_metadata=web_metadata or {},
             created_at=now,
         )
 
@@ -472,6 +522,7 @@ class ConversationStore:
 
             turns: list[ConversationTurn] = []
             for tr in turn_rows:
+                tr_keys = tr.keys()
                 turns.append(
                     ConversationTurn(
                         turn_id=tr["turn_id"],
@@ -482,6 +533,9 @@ class ConversationStore:
                         answer=tr["answer"],
                         sources=json.loads(tr["sources"] or "[]"),
                         generation_metadata=json.loads(tr["generation_metadata"] or "{}"),
+                        routing_metadata=json.loads(tr["routing_metadata"] or "{}") if "routing_metadata" in tr_keys else {},
+                        retrieval_metadata=json.loads(tr["retrieval_metadata"] or "{}") if "retrieval_metadata" in tr_keys else {},
+                        web_metadata=json.loads(tr["web_metadata"] or "{}") if "web_metadata" in tr_keys else {},
                         created_at=tr["created_at"],
                     )
                 )
@@ -514,6 +568,39 @@ class ConversationStore:
         if max_turns is not None and max_turns > 0:
             return conv.turns[-max_turns:]
         return conv.turns
+
+    def get_last_retrieval_context(
+        self,
+        conversation_id: str,
+        user_id: Optional[str] = None,
+        organization: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Retrieve previous retrieval context (sources, metadata, query) from the last turn.
+        """
+        turns = self.get_conversation_turns(conversation_id, max_turns=1, user_id=user_id, organization=organization)
+        if not turns:
+            return None
+        last_turn = turns[-1]
+        has_evidence = bool(last_turn.sources)
+        return {
+            "has_previous_evidence": has_evidence,
+            "sources": last_turn.sources,
+            "retrieval_metadata": last_turn.retrieval_metadata or {},
+            "routing_metadata": last_turn.routing_metadata or {},
+            "last_query": last_turn.query,
+            "last_answer": last_turn.answer,
+            "page_references": [
+                {
+                    "document_id": s.get("document_id"),
+                    "page_number": s.get("page_number"),
+                    "source_id": s.get("source_id"),
+                }
+                for s in last_turn.sources
+                if isinstance(s, dict)
+            ],
+            "result_count": len(last_turn.sources),
+        }
 
     def list_conversations(
         self,

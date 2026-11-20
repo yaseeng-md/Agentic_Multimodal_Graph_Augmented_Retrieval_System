@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -612,13 +615,8 @@ def retrieve(
     visual_candidates: list[dict[str, Any]] = []
     graph_pages: list[dict[str, Any]] = []
 
-    # -----------------------------------------------------------------------
-    # 3. Path A: Visual retrieval using ColPali + Qdrant
-    # -----------------------------------------------------------------------
-    if visual_active:
-
+    def _execute_visual_retrieval() -> list[dict[str, Any]]:
         print("[Retrieval] Executing Visual Retrieval...")
-
         encoder = get_query_encoder()
         query_embedding = encoder.encode(query)
 
@@ -637,7 +635,7 @@ def retrieve(
             with_vectors=False,
         )
 
-        visual_candidates = [
+        candidates = [
             _serialise_point(point, rank=index)
             for index, point in enumerate(
                 response.points,
@@ -647,8 +645,15 @@ def retrieve(
 
         print(
             f"[Retrieval] Visual candidates: "
-            f"{len(visual_candidates)}"
+            f"{len(candidates)}"
         )
+        return candidates
+
+    # -----------------------------------------------------------------------
+    # 3. Path A: Visual retrieval using ColPali + Qdrant
+    # -----------------------------------------------------------------------
+    if visual_active:
+        visual_candidates = _execute_visual_retrieval()
 
     # -----------------------------------------------------------------------
     # 4. Path B: Graph retrieval using Neo4j
@@ -722,22 +727,69 @@ def retrieve(
             })
 
     # -----------------------------------------------------------------------
+    # 4b. Graph-to-Qdrant Fallback Evaluation
+    # -----------------------------------------------------------------------
+    fallback_metadata: dict[str, Any] = {
+        "triggered": False,
+        "reason": None,
+        "from_strategy": None,
+        "to_strategy": None,
+    }
+
+    # Evaluate whether Graph retrieval produced usable results
+    graph_has_usable_results = bool(graph_pages) and any(
+        bool(p.get("document_id")) for p in graph_pages
+    )
+
+    if graph_active and not visual_active and not graph_has_usable_results:
+        fallback_reason = (
+            graph_metadata.get("error")
+            or "Graph retrieval produced 0 usable entities, claims, or source pages"
+        )
+        logger.info(
+            "Graph retrieval produced no usable results for query '%s' (%s). "
+            "Triggering fallback to Visual retrieval (Qdrant + ColPali).",
+            query,
+            fallback_reason,
+        )
+        print(f"[Retrieval] Fallback triggered: {fallback_reason}. Executing Qdrant visual retrieval...")
+        try:
+            visual_candidates = _execute_visual_retrieval()
+            fallback_metadata = {
+                "triggered": True,
+                "reason": fallback_reason,
+                "from_strategy": "graph",
+                "to_strategy": "visual",
+            }
+        except Exception as f_exc:
+            logger.error("Fallback visual retrieval failed: %s", f_exc, exc_info=True)
+            fallback_metadata = {
+                "triggered": True,
+                "reason": f"Fallback visual retrieval failed: {f_exc}",
+                "from_strategy": "graph",
+                "to_strategy": "visual",
+                "error": str(f_exc),
+            }
+
+    # -----------------------------------------------------------------------
     # 5. Merge candidates
     # -----------------------------------------------------------------------
-    if graph_active and graph_pages:
+    final_strategy = retrieval_strategy
 
-        merged_candidates = _merge_retrieval_candidates(
-            visual_candidates=visual_candidates,
-            graph_candidates=graph_pages,
-            limit=fetch_limit,
-        )
-
-    else:
-        merged_candidates = visual_candidates
-
-        # Graph-only retrieval: use graph results directly.
-        if graph_active:
+    if fallback_metadata["triggered"]:
+        final_strategy = "visual"
+        merged_candidates = visual_candidates[:fetch_limit]
+    elif graph_active and graph_pages:
+        if visual_active and visual_candidates:
+            merged_candidates = _merge_retrieval_candidates(
+                visual_candidates=visual_candidates,
+                graph_candidates=graph_pages,
+                limit=fetch_limit,
+            )
+        else:
             merged_candidates = graph_pages[:fetch_limit]
+    else:
+        merged_candidates = visual_candidates[:fetch_limit] if visual_candidates else graph_pages[:fetch_limit]
 
     print(
         f"[Retrieval] Total merged candidates: "
@@ -797,9 +849,13 @@ def retrieve(
 
         "retrieval_strategy": retrieval_strategy,
 
+        "final_strategy": final_strategy,
+
+        "fallback": fallback_metadata,
+
         "retrieval_flags": {
             "enable_graph": graph_active,
-            "enable_visual": visual_active,
+            "enable_visual": visual_active or fallback_metadata["triggered"],
         },
 
         "top_k": top_k,
